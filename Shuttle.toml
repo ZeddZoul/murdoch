@@ -1,0 +1,19 @@
+# Shuttle.rs deployment configuration for Murdoch Discord Bot
+# https://docs.shuttle.rs/configuration/files
+
+name = "murdoch"
+
+[deploy]
+# Secrets are configured via `shuttle secrets set` command
+# Required secrets:
+#   - DISCORD_TOKEN
+#   - GEMINI_API_KEY
+#   - MOD_CHANNEL_ID
+#   - MOD_ROLE_ID
+#
+# Optional secrets:
+#   - BUFFER_FLUSH_THRESHOLD (default: 10)
+#   - BUFFER_TIMEOUT_SECS (default: 30)
+#   - REGEX_SLURS (comma-separated)
+#   - REGEX_INVITE_LINKS (comma-separated)
+#   - REGEX_PHISHING_URLS (comma-separated)
