@@ -221,6 +221,92 @@ pub struct ViolationEntry {
     pub timestamp: String,
 }
 
+/// Server health and compliance metrics.
+#[derive(Serialize)]
+pub struct HealthMetrics {
+    pub health_score: u8,
+    pub violation_rate: f64,
+    pub action_distribution: ActionDistribution,
+    pub trends: TrendIndicators,
+}
+
+#[derive(Serialize)]
+pub struct ActionDistribution {
+    pub warnings_pct: f64,
+    pub timeouts_pct: f64,
+    pub kicks_pct: f64,
+    pub bans_pct: f64,
+}
+
+#[derive(Serialize)]
+pub struct TrendIndicators {
+    pub messages_change_pct: f64,
+    pub violations_change_pct: f64,
+    pub health_change: i8,
+}
+
+/// Top offenders response.
+#[derive(Serialize)]
+pub struct TopOffendersResponse {
+    pub top_users: Vec<OffenderEntry>,
+    pub violation_distribution: HashMap<u32, u32>,
+    pub moderated_users_pct: f64,
+}
+
+#[derive(Serialize)]
+pub struct OffenderEntry {
+    pub user_id: String,
+    pub username: Option<String>,
+    pub violation_count: u32,
+    pub warning_level: u8,
+    pub last_violation: String,
+}
+
+/// Rule effectiveness response.
+#[derive(Serialize)]
+pub struct RuleEffectivenessResponse {
+    pub top_rules: Vec<RuleStats>,
+    pub total_rule_violations: u64,
+}
+
+#[derive(Serialize)]
+pub struct RuleStats {
+    pub rule_name: String,
+    pub violation_count: u64,
+    pub severity_distribution: HashMap<String, u64>,
+}
+
+/// Temporal analytics response.
+#[derive(Serialize)]
+pub struct TemporalAnalytics {
+    pub heatmap: Vec<HeatmapCell>,
+    pub peak_times: Vec<PeakTime>,
+    pub major_events: Vec<ModerationEvent>,
+    pub avg_violations_per_hour: f64,
+}
+
+#[derive(Serialize)]
+pub struct HeatmapCell {
+    pub day_of_week: u8,
+    pub hour: u8,
+    pub violation_count: u32,
+}
+
+#[derive(Serialize)]
+pub struct PeakTime {
+    pub day_of_week: u8,
+    pub hour: u8,
+    pub violation_count: u32,
+}
+
+#[derive(Serialize)]
+pub struct ModerationEvent {
+    pub timestamp: String,
+    pub event_type: String,
+    pub description: String,
+    pub violation_count: u32,
+}
+
 impl ApiRouter {
     /// Build the Axum router with all API routes.
     pub fn build_router(self: Arc<Self>) -> Router;
@@ -327,6 +413,10 @@ CREATE INDEX idx_audit_guild ON audit_log(guild_id);
 | GET | `/api/servers/:id/warnings` | List users with warnings |
 | GET | `/api/servers/:id/warnings/:user_id` | Get user warning details |
 | DELETE | `/api/servers/:id/warnings/:user_id` | Clear user warnings |
+| GET | `/api/servers/:id/health` | Get server health metrics |
+| GET | `/api/servers/:id/top-offenders` | Get top offenders list |
+| GET | `/api/servers/:id/rule-effectiveness` | Get rule effectiveness stats |
+| GET | `/api/servers/:id/temporal-analytics` | Get temporal analytics data |
 
 ## Correctness Properties
 
@@ -380,6 +470,70 @@ CREATE INDEX idx_audit_guild ON audit_log(guild_id);
 *For any* bulk warning clear operation with a date threshold, only warnings with last_violation older than the threshold SHALL be cleared.
 **Validates: Requirements 7.5**
 
+### Property 13: Health Score Bounds
+*For any* set of server metrics (violation rate, response time, escalation rate), the calculated health score SHALL be between 0 and 100 inclusive.
+**Validates: Requirements 10.1**
+
+### Property 14: Violation Rate Calculation
+*For any* number of violations and messages processed, the violation rate SHALL equal (violations / messages) * 1000.
+**Validates: Requirements 10.2**
+
+### Property 15: Action Distribution Percentages
+*For any* set of moderation actions (warnings, timeouts, kicks, bans), the calculated percentages SHALL sum to 100% (within floating point tolerance).
+**Validates: Requirements 10.3**
+
+### Property 16: Trend Calculation Accuracy
+*For any* two time periods with metrics, the trend percentage SHALL equal ((current - previous) / previous) * 100.
+**Validates: Requirements 10.4**
+
+### Property 17: Health Warning Threshold
+*For any* health score below 70, the response SHALL include a warning indicator flag.
+**Validates: Requirements 10.5**
+
+### Property 18: Top Offenders Sorting and Limiting
+*For any* set of users with violations, the top offenders list SHALL be sorted by violation count descending and limited to 10 entries.
+**Validates: Requirements 11.1**
+
+### Property 19: Offender Entry Completeness
+*For any* offender entry in the response, all required fields (user_id, username, violation_count, warning_level, last_violation) SHALL be present.
+**Validates: Requirements 11.2**
+
+### Property 20: Violation Distribution Accuracy
+*For any* set of violations grouped by user, the distribution map SHALL accurately count how many users have each violation count.
+**Validates: Requirements 11.4**
+
+### Property 21: Moderated Users Percentage
+*For any* total user count and moderated user count, the percentage SHALL equal (moderated / total) * 100.
+**Validates: Requirements 11.5**
+
+### Property 22: Rule Violation Grouping
+*For any* set of violations with rule associations, the breakdown SHALL accurately count violations per rule with no violations lost or double-counted.
+**Validates: Requirements 12.1**
+
+### Property 23: Top Rules Sorting and Limiting
+*For any* set of rule statistics, the top rules list SHALL be sorted by violation count descending and limited to 5 entries.
+**Validates: Requirements 12.2**
+
+### Property 24: Rule Severity Distribution
+*For any* rule's violations, the severity distribution SHALL accurately count violations by severity level with all violations accounted for.
+**Validates: Requirements 12.3**
+
+### Property 25: Time Period Filtering
+*For any* time period filter applied to rule effectiveness data, only violations with timestamps within that period SHALL be included in the counts.
+**Validates: Requirements 12.5**
+
+### Property 26: Heatmap Aggregation and Peak Detection
+*For any* set of violations with timestamps, the heatmap SHALL accurately count violations for each hour/day combination, and peak times SHALL be the cells with the highest counts.
+**Validates: Requirements 13.1, 13.2**
+
+### Property 27: Major Event Detection
+*For any* set of violations, major events (defined as 10+ violations within 5 minutes) SHALL be identified and included in the timeline.
+**Validates: Requirements 13.3**
+
+### Property 28: Average Violations Per Hour
+*For any* set of violations and time period in hours, the average SHALL equal total violations divided by the number of hours in the period.
+**Validates: Requirements 13.4**
+
 ## Error Handling
 
 | Error Condition | HTTP Status | Handling Strategy |
@@ -407,6 +561,14 @@ CREATE INDEX idx_audit_guild ON audit_log(guild_id);
 - Permission filtering correctness
 - Time range filtering for metrics
 - Pagination bounds validation
+- Health score calculation bounds (0-100)
+- Violation rate calculation accuracy
+- Action distribution percentage summation
+- Trend calculation accuracy
+- Top N sorting and limiting (offenders and rules)
+- Aggregation accuracy (violation distribution, rule grouping)
+- Heatmap generation and peak detection
+- Time period filtering correctness
 
 ### Integration Tests
 - Full OAuth flow with mock Discord API

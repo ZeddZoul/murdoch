@@ -2,10 +2,24 @@
 //!
 //! Handles authorization URL generation, token exchange, and Discord API calls.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use tokio::sync::{Mutex, RwLock};
 
 use crate::error::{MurdochError, Result};
+
+/// Cache entry for user guilds.
+struct GuildCacheEntry {
+    guilds: Vec<UserGuild>,
+    cached_at: Instant,
+}
+
+/// How long to cache guild lists (60 seconds).
+const GUILD_CACHE_TTL: Duration = Duration::from_secs(60);
 
 /// Discord OAuth2 configuration and handlers.
 pub struct OAuthHandler {
@@ -13,6 +27,10 @@ pub struct OAuthHandler {
     client_secret: String,
     redirect_uri: String,
     http_client: Client,
+    /// Cache of user guilds keyed by access_token hash.
+    guild_cache: Arc<RwLock<HashMap<String, GuildCacheEntry>>>,
+    /// Lock to prevent concurrent fetches for the same user.
+    fetch_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
 
 /// OAuth tokens from Discord.
@@ -40,18 +58,26 @@ pub struct DiscordUser {
 pub struct UserGuild {
     pub id: String,
     pub name: String,
+    #[serde(default)]
     pub icon: Option<String>,
     pub owner: bool,
-    pub permissions: String,
+    #[serde(default)]
+    pub permissions: Option<serde_json::Value>,
 }
 
 impl UserGuild {
     /// Check if user has ADMINISTRATOR permission (0x8).
     pub fn is_admin(&self) -> bool {
-        self.permissions
+        let perms_str = match &self.permissions {
+            Some(serde_json::Value::String(s)) => s.clone(),
+            Some(serde_json::Value::Number(n)) => n.to_string(),
+            _ => return self.owner, // Owners are always admins
+        };
+
+        perms_str
             .parse::<u64>()
             .map(|p| p & 0x8 != 0)
-            .unwrap_or(false)
+            .unwrap_or(self.owner)
     }
 }
 
@@ -73,6 +99,8 @@ impl OAuthHandler {
             client_secret,
             redirect_uri,
             http_client: Client::new(),
+            guild_cache: Arc::new(RwLock::new(HashMap::new())),
+            fetch_locks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -194,8 +222,54 @@ impl OAuthHandler {
             .map_err(|e| MurdochError::OAuth(format!("Failed to parse user response: {}", e)))
     }
 
-    /// Get user's guilds with permissions.
+    /// Create a cache key from the access token (use first 16 chars as pseudo-hash).
+    fn cache_key(access_token: &str) -> String {
+        access_token.chars().take(16).collect()
+    }
+
+    /// Get or create a lock for fetching guilds for a specific user.
+    async fn get_fetch_lock(&self, key: &str) -> Arc<Mutex<()>> {
+        let mut locks = self.fetch_locks.lock().await;
+        locks
+            .entry(key.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    /// Get user's guilds with permissions (cached for 60 seconds).
+    /// Uses a per-user lock to prevent concurrent API calls for the same user.
     pub async fn get_user_guilds(&self, access_token: &str) -> Result<Vec<UserGuild>> {
+        let key = Self::cache_key(access_token);
+
+        // Check cache first (without lock)
+        {
+            let cache = self.guild_cache.read().await;
+            if let Some(entry) = cache.get(&key) {
+                if entry.cached_at.elapsed() < GUILD_CACHE_TTL {
+                    tracing::debug!("Returning cached guilds for user");
+                    return Ok(entry.guilds.clone());
+                }
+            }
+        }
+
+        // Get per-user lock to prevent concurrent fetches
+        let fetch_lock = self.get_fetch_lock(&key).await;
+        let _guard = fetch_lock.lock().await;
+
+        // Check cache again (another request might have populated it while we waited)
+        {
+            let cache = self.guild_cache.read().await;
+            if let Some(entry) = cache.get(&key) {
+                if entry.cached_at.elapsed() < GUILD_CACHE_TTL {
+                    tracing::debug!("Returning cached guilds for user (after lock)");
+                    return Ok(entry.guilds.clone());
+                }
+            }
+        }
+
+        tracing::info!("Fetching guilds from Discord API");
+
+        // Fetch from Discord API
         let response = self
             .http_client
             .get("https://discord.com/api/users/@me/guilds")
@@ -213,10 +287,24 @@ impl OAuthHandler {
             )));
         }
 
-        response
-            .json::<Vec<UserGuild>>()
+        let guilds: Vec<UserGuild> = response
+            .json()
             .await
-            .map_err(|e| MurdochError::OAuth(format!("Failed to parse guilds response: {}", e)))
+            .map_err(|e| MurdochError::OAuth(format!("Failed to parse guilds response: {}", e)))?;
+
+        // Update cache
+        {
+            let mut cache = self.guild_cache.write().await;
+            cache.insert(
+                key,
+                GuildCacheEntry {
+                    guilds: guilds.clone(),
+                    cached_at: Instant::now(),
+                },
+            );
+        }
+
+        Ok(guilds)
     }
 
     /// Get user's guilds filtered to only those where user is admin.
@@ -237,7 +325,7 @@ mod tests {
             name: "Test".to_string(),
             icon: None,
             owner: false,
-            permissions: "8".to_string(),
+            permissions: Some(serde_json::json!("8")),
         };
         assert!(guild.is_admin());
     }
@@ -249,7 +337,7 @@ mod tests {
             name: "Test".to_string(),
             icon: None,
             owner: false,
-            permissions: "2147483656".to_string(),
+            permissions: Some(serde_json::json!("2147483656")),
         };
         assert!(guild.is_admin());
     }
@@ -261,7 +349,7 @@ mod tests {
             name: "Test".to_string(),
             icon: None,
             owner: false,
-            permissions: "104324673".to_string(),
+            permissions: Some(serde_json::json!("104324673")),
         };
         assert!(!guild.is_admin());
     }
@@ -273,7 +361,7 @@ mod tests {
             name: "Test".to_string(),
             icon: None,
             owner: false,
-            permissions: "0".to_string(),
+            permissions: Some(serde_json::json!("0")),
         };
         assert!(!guild.is_admin());
     }
@@ -328,20 +416,18 @@ mod property_tests {
                     name,
                     icon: None,
                     owner: false,
-                    permissions: perms.to_string(),
+                    permissions: Some(serde_json::json!(perms.to_string())),
                 })
                 .collect();
 
             let admin_guilds: Vec<&UserGuild> = user_guilds.iter().filter(|g| g.is_admin()).collect();
 
             for guild in &admin_guilds {
-                let perms: u64 = guild.permissions.parse().unwrap();
-                assert!(perms & 0x8 != 0, "Guild {} should have ADMINISTRATOR permission", guild.id);
+                assert!(guild.is_admin(), "Guild {} should have ADMINISTRATOR permission", guild.id);
             }
 
             for guild in &user_guilds {
-                let perms: u64 = guild.permissions.parse().unwrap();
-                let is_admin = perms & 0x8 != 0;
+                let is_admin = guild.is_admin();
                 let in_admin_list = admin_guilds.iter().any(|g| g.id == guild.id);
 
                 if is_admin {

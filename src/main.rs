@@ -55,7 +55,7 @@ impl MurdochHandler {
 
 #[serenity::async_trait]
 impl EventHandler for MurdochHandler {
-    async fn message(&self, _ctx: Context, msg: serenity::model::channel::Message) {
+    async fn message(&self, ctx: Context, msg: serenity::model::channel::Message) {
         // Ignore bot messages
         if msg.author.bot {
             return;
@@ -65,6 +65,44 @@ impl EventHandler for MurdochHandler {
 
         // Record message for metrics
         self.state.metrics.record_message(guild_id).await;
+
+        // Check for per-user spam (single user sending too many messages)
+        if let Some(trigger) = self
+            .state
+            .raid_detector
+            .check_user_spam(guild_id, msg.author.id.get())
+            .await
+        {
+            tracing::warn!(
+                guild_id = guild_id,
+                user_id = %msg.author.id,
+                trigger = ?trigger,
+                "User spam detected - timing out user"
+            );
+
+            // Timeout the spamming user for 10 minutes
+            if let Some(guild) = msg.guild_id {
+                if let Ok(mut member) = guild.member(&ctx.http, msg.author.id).await {
+                    use chrono::Utc;
+                    use serenity::model::Timestamp;
+                    let timeout_until = Timestamp::from_unix_timestamp(
+                        Utc::now().timestamp() + 600 // 10 minutes
+                    ).unwrap_or_else(|_| Timestamp::now());
+                    if let Err(e) = member
+                        .disable_communication_until_datetime(&ctx.http, timeout_until)
+                        .await
+                    {
+                        tracing::error!(error = %e, "Failed to timeout spam user");
+                    } else {
+                        tracing::info!(
+                            user_id = %msg.author.id,
+                            "User timed out for spam"
+                        );
+                    }
+                }
+            }
+            return; // Don't process further if user is spamming
+        }
 
         // Check for message flood (raid detection)
         if let Some(trigger) = self
@@ -212,7 +250,7 @@ fn spawn_background_tasks(
 }
 
 /// Build OAuth handler if credentials are configured.
-fn build_oauth_handler() -> Option<OAuthHandler> {
+fn build_oauth_handler() -> Option<(OAuthHandler, String)> {
     let client_id = std::env::var("DISCORD_CLIENT_ID").ok()?;
     let client_secret = std::env::var("DISCORD_CLIENT_SECRET").ok()?;
 
@@ -225,7 +263,10 @@ fn build_oauth_handler() -> Option<OAuthHandler> {
         std::env::var("DASHBOARD_URL").unwrap_or_else(|_| "http://localhost:3000".to_string());
     let redirect_uri = format!("{}/api/auth/callback", dashboard_url.trim_end_matches('/'));
 
-    Some(OAuthHandler::new(client_id, client_secret, redirect_uri))
+    Some((
+        OAuthHandler::new(client_id.clone(), client_secret, redirect_uri),
+        client_id,
+    ))
 }
 
 #[tokio::main]
@@ -340,7 +381,7 @@ async fn main() -> Result<()> {
     tracing::info!("Background tasks spawned");
 
     // Spawn web dashboard server if OAuth is configured
-    if let Some(oauth) = oauth_handler {
+    if let Some((oauth, client_id)) = oauth_handler {
         let dashboard_url =
             std::env::var("DASHBOARD_URL").unwrap_or_else(|_| "http://localhost:3000".to_string());
         let web_port: u16 = std::env::var("WEB_PORT")
@@ -356,6 +397,7 @@ async fn main() -> Result<()> {
             rules_engine: rules_engine.clone(),
             warning_system: warning_system.clone(),
             dashboard_url,
+            client_id,
         };
 
         let router = web::build_router(web_state);

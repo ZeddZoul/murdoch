@@ -41,6 +41,9 @@ pub struct RegexPatternConfig {
     /// Phishing URL patterns.
     #[serde(default)]
     pub phishing_urls: Vec<String>,
+    /// Spam keyword patterns.
+    #[serde(default)]
+    pub spam_keywords: Vec<String>,
 }
 
 impl MurdochConfig {
@@ -114,6 +117,7 @@ fn load_regex_patterns() -> Result<RegexPatternConfig> {
         slurs,
         invite_links,
         phishing_urls,
+        spam_keywords: parse_pattern_list("REGEX_SPAM_KEYWORDS"),
     })
 }
 
@@ -151,6 +155,7 @@ fn default_patterns() -> RegexPatternConfig {
             r"steam-?community.*\.(?:com|net|org|xyz|ru)".to_string(),
             r"free-?nitro.*\.(?:com|net|org|xyz|ru)".to_string(),
         ],
+        spam_keywords: vec![],
     }
 }
 
@@ -204,6 +209,7 @@ mod tests {
             slurs: vec!["slur1".to_string()],
             invite_links: vec!["discord\\.gg".to_string()],
             phishing_urls: vec!["phish\\.com".to_string()],
+            spam_keywords: vec!["spam".to_string()],
         };
 
         let json = serde_json::to_string(&config).expect("serialize");
@@ -229,11 +235,15 @@ mod property_tests {
             prop::collection::vec(arb_pattern(), 0..5),
             prop::collection::vec(arb_pattern(), 0..5),
             prop::collection::vec(arb_pattern(), 0..5),
+            prop::collection::vec(arb_pattern(), 0..5),
         )
-            .prop_map(|(slurs, invite_links, phishing_urls)| RegexPatternConfig {
-                slurs,
-                invite_links,
-                phishing_urls,
+            .prop_map(|(slurs, invite_links, phishing_urls, spam_keywords)| {
+                RegexPatternConfig {
+                    slurs,
+                    invite_links,
+                    phishing_urls,
+                    spam_keywords,
+                }
             })
     }
 

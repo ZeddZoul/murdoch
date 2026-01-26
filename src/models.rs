@@ -94,6 +94,7 @@ pub enum PatternType {
     Slur,
     InviteLink,
     PhishingUrl,
+    Spam,
 }
 
 /// Result of regex filter evaluation.

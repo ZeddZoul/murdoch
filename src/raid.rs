@@ -26,6 +26,13 @@ pub enum RaidTrigger {
         /// Similarity ratio (0.0-1.0).
         similarity: f32,
     },
+    /// Single user sending too many messages.
+    UserSpam {
+        /// User ID of the spammer.
+        user_id: u64,
+        /// Number of messages in the window.
+        count: u32,
+    },
 }
 
 /// Raid mode status for a guild.
@@ -74,6 +81,10 @@ pub struct RaidConfig {
     pub similarity_threshold: f32,
     /// Raid mode auto-expiry duration (default: 10 minutes).
     pub raid_expiry: Duration,
+    /// Time window for per-user spam detection (default: 10 seconds).
+    pub user_spam_window: Duration,
+    /// Number of messages from one user to trigger spam (default: 10).
+    pub user_spam_threshold: u32,
 }
 
 impl Default for RaidConfig {
@@ -87,6 +98,8 @@ impl Default for RaidConfig {
             message_threshold: 5,
             similarity_threshold: 0.8,
             raid_expiry: Duration::from_secs(600), // 10 minutes
+            user_spam_window: Duration::from_secs(10),
+            user_spam_threshold: 10,
         }
     }
 }
@@ -98,6 +111,8 @@ pub struct RaidDetector {
     recent_joins: Arc<RwLock<HashMap<u64, VecDeque<JoinRecord>>>>,
     /// Recent message hashes per guild.
     recent_messages: Arc<RwLock<HashMap<u64, VecDeque<MessageRecord>>>>,
+    /// Per-user message timestamps: guild_id -> (user_id -> timestamps).
+    user_messages: Arc<RwLock<HashMap<u64, HashMap<u64, VecDeque<Instant>>>>>,
     /// Raid mode status per guild.
     raid_mode: Arc<RwLock<HashMap<u64, RaidModeStatus>>>,
 }
@@ -114,6 +129,7 @@ impl RaidDetector {
             config,
             recent_joins: Arc::new(RwLock::new(HashMap::new())),
             recent_messages: Arc::new(RwLock::new(HashMap::new())),
+            user_messages: Arc::new(RwLock::new(HashMap::new())),
             raid_mode: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -240,6 +256,40 @@ impl RaidDetector {
         None
     }
 
+    /// Check if a single user is spamming (sending too many messages too fast).
+    ///
+    /// Returns Some(RaidTrigger::UserSpam) if the user exceeds the threshold.
+    /// This is separate from raid mode - it's per-user punishment.
+    pub async fn check_user_spam(&self, guild_id: u64, user_id: u64) -> Option<RaidTrigger> {
+        let now = Instant::now();
+
+        let mut user_messages = self.user_messages.write().await;
+        let guild_users = user_messages.entry(guild_id).or_insert_with(HashMap::new);
+        let user_timestamps = guild_users.entry(user_id).or_insert_with(VecDeque::new);
+
+        // Add current message timestamp
+        user_timestamps.push_back(now);
+
+        // Remove old timestamps outside the window
+        let cutoff = now - self.config.user_spam_window;
+        while user_timestamps.front().is_some_and(|&t| t < cutoff) {
+            user_timestamps.pop_front();
+        }
+
+        // Check if user exceeded threshold
+        let message_count = user_timestamps.len() as u32;
+        if message_count >= self.config.user_spam_threshold {
+            // Clear the user's timestamps to avoid repeated triggers
+            user_timestamps.clear();
+            return Some(RaidTrigger::UserSpam {
+                user_id,
+                count: message_count,
+            });
+        }
+
+        None
+    }
+
     /// Check if raid mode is active for a guild.
     pub async fn is_raid_mode(&self, guild_id: u64) -> bool {
         let raid_mode = self.raid_mode.read().await;
@@ -344,6 +394,8 @@ mod tests {
             message_threshold: 3,
             similarity_threshold: 0.5,
             raid_expiry: Duration::from_millis(100), // Short for testing
+            user_spam_window: Duration::from_secs(10),
+            user_spam_threshold: 5,
         }
     }
 

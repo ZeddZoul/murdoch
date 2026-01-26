@@ -105,6 +105,7 @@ impl ModDirectorPipeline {
                     crate::models::PatternType::Slur => SeverityLevel::High,
                     crate::models::PatternType::InviteLink => SeverityLevel::Medium,
                     crate::models::PatternType::PhishingUrl => SeverityLevel::High,
+                    crate::models::PatternType::Spam => SeverityLevel::Medium,
                 };
 
                 let report = ViolationReportBuilder::new()

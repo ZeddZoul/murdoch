@@ -134,3 +134,52 @@ This document specifies a web-based dashboard for the Murdoch Discord moderation
 4. THE Frontend SHALL provide clear visual feedback for loading states
 5. THE Frontend SHALL display error states gracefully with retry options
 
+### Requirement 10: Server Compliance and Health Metrics
+
+**User Story:** As a server administrator, I want to see a compliance score and health metrics for my server, so that I can quickly assess how well moderation is working.
+
+#### Acceptance Criteria
+
+1. THE Dashboard SHALL calculate and display a server health score from 0-100 based on violation rate, response time, and warning escalation rate
+2. THE Dashboard SHALL display the violation rate as violations per 1000 messages
+3. THE Dashboard SHALL display the percentage of violations that resulted in warnings, timeouts, kicks, and bans
+4. THE Dashboard SHALL show trend indicators comparing current period metrics to the previous period
+5. WHEN the health score is below 70, THE Dashboard SHALL display a warning indicator
+6. THE Dashboard SHALL provide explanatory tooltips for how the health score is calculated
+
+### Requirement 11: Top Offenders and User Analytics
+
+**User Story:** As a server administrator, I want to see which users have the most violations, so that I can identify problematic members quickly.
+
+#### Acceptance Criteria
+
+1. THE Dashboard SHALL display a widget showing the top 10 users by violation count for the selected time period
+2. WHEN viewing top offenders, THE Dashboard SHALL show: username, violation count, warning level, last violation date
+3. WHEN clicking a user in the top offenders list, THE Dashboard SHALL navigate to that user's detailed violation history
+4. THE Dashboard SHALL display a chart showing violation distribution across users (e.g., how many users have 1, 2, 3+ violations)
+5. THE Dashboard SHALL show the percentage of total users who have been moderated
+
+### Requirement 12: Rule Effectiveness Analytics
+
+**User Story:** As a server administrator, I want to see which rules are triggered most often, so that I can understand what content is being moderated.
+
+#### Acceptance Criteria
+
+1. WHEN custom rules are configured, THE Dashboard SHALL display a breakdown of violations by rule
+2. THE Dashboard SHALL show the top 5 most frequently triggered rules
+3. THE Dashboard SHALL display the severity distribution for each rule
+4. WHEN a rule has zero violations, THE Dashboard SHALL indicate this
+5. THE Dashboard SHALL support viewing rule effectiveness over different time periods
+
+### Requirement 13: Temporal Analytics
+
+**User Story:** As a server administrator, I want to see when violations occur most frequently, so that I can understand activity patterns in my server.
+
+#### Acceptance Criteria
+
+1. THE Dashboard SHALL display a heatmap showing violations by hour of day and day of week
+2. THE Dashboard SHALL identify and highlight peak violation times
+3. THE Dashboard SHALL show a timeline of major moderation events (raids, mass violations)
+4. THE Dashboard SHALL display average violations per hour for the selected time period
+5. WHEN hovering over the heatmap, THE Dashboard SHALL show detailed violation counts for that time slot
+
