@@ -1,12 +1,10 @@
 pub mod analyzer;
 pub mod appeals;
-pub mod backup;
 pub mod buffer;
 pub mod cache;
 pub mod commands;
 pub mod config;
 pub mod context;
-pub mod critical_events;
 pub mod database;
 pub mod discord;
 pub mod error;
