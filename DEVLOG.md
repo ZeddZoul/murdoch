@@ -2816,3 +2816,115 @@ Tailwind CSS (loaded from CDN) can override custom styles. Solutions used:
 
 - `@media (max-width: 480px)` - Small mobile phones
 - `@media (max-width: 400px)` - Very small screens (pagination icons only)
+
+---
+
+## Week 3 - January 27-29, 2026
+
+### January 29, 2026 - Code Quality & Dead Code Cleanup
+
+#### Session Overview
+
+Focused on code quality improvements and preparing for hackathon submission.
+
+---
+
+#### 1. AI Code Pattern Cleanup
+
+Removed formulaic AI-written patterns from 8 Rust source files:
+
+**Files Modified:**
+
+- `src/analyzer.rs` - Removed redundant inline comments ("// Build request", "// Check for rate limiting", etc.)
+- `src/buffer.rs` - Removed 6 field comments that just restated field names
+- `src/context.rs` - Removed trivial doc comments from ContextTracker methods
+- `src/filter.rs` - Simplified PatternSet and RegexFilter documentation
+- `src/warnings.rs` - Removed obvious doc comments
+- `src/models.rs` - Removed redundant struct/function comments
+- `src/database.rs` - Simplified docs
+- `src/pipeline.rs` - Removed builder method docs and inline comments
+
+**Patterns Removed:**
+
+- `/// This function/method/struct does X` → Just describe X
+- `// Initialize the thing` before `let thing = Thing::new()`
+- `// Handle the response` before response handling code
+- `/// Create a new X with the given Y` → Removed entirely (obvious from signature)
+
+---
+
+#### 2. Dead Code Deletion
+
+Found and deleted 7 files that were never used:
+
+| File                          | Lines | Reason                               |
+| ----------------------------- | ----- | ------------------------------------ |
+| `web/js/websocket.js`         | 399   | Exported but never imported          |
+| `web/theme-test.html`         | ~50   | Test file                            |
+| `web/THEME_IMPLEMENTATION.md` | ~100  | Documentation artifact               |
+| `web/LIGHTHOUSE_AUDIT.md`     | ~50   | Audit notes                          |
+| `Shuttle.toml`                | 3     | Old deployment config (using Fly.io) |
+| `clippy_output.log`           | ~100  | Build artifact                       |
+| `test_output.log`             | ~50   | Build artifact                       |
+
+Also removed unused `<script>` import from `web/index.html`:
+
+```html
+<!-- Removed -->
+<script type="module" src="/js/websocket.js?v=6"></script>
+```
+
+**Note:** The Rust `src/websocket.rs` module is still used - it's the backend WebSocket server. Only the unused JS client was deleted.
+
+---
+
+#### 3. Gemini Model URL Correction
+
+Fixed the Gemini API URL in `src/analyzer.rs`:
+
+- Incorrect: `gemini-2.0-flash` (reverted attempt)
+- Correct: `gemini-3-flash-preview` (current production model)
+
+---
+
+#### 4. Kiro Submission Preparation
+
+Created `.kiro/` directory structure for hackathon submission:
+
+```
+.kiro/
+├── global-rules.md      # Project conventions and principles
+├── steering/
+│   └── agent-profile.md # Agent configuration (existing)
+├── specs/
+│   ├── dashboard-improvements/
+│   ├── murdoch-discord-bot/
+│   ├── murdoch-enhancements/
+│   ├── single-page-dashboard/
+│   └── web-dashboard/
+└── commands/
+    ├── code-quality.md  # Code quality check prompts
+    ├── deploy.md        # Fly.io deployment prompts
+    └── add-feature.md   # Feature addition workflow
+```
+
+---
+
+#### Test Results
+
+All 259 tests passing after cleanup:
+
+```
+test result: ok. 259 passed; 0 failed; 0 ignored
+```
+
+---
+
+#### Deployment Status
+
+Fly.io deployment verified working:
+
+- App: `murdoch-bot`
+- Region: SJC
+- Model: `gemini-3-flash-preview`
+- Status: Healthy, processing violations

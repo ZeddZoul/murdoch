@@ -61,7 +61,6 @@ impl Default for ServerConfig {
 }
 
 impl ServerConfig {
-    /// Create a new config with the given guild ID and defaults.
     pub fn new(guild_id: u64) -> Self {
         Self {
             guild_id,
@@ -70,18 +69,14 @@ impl ServerConfig {
     }
 }
 
-/// Database connection pool wrapper with in-memory cache.
 #[derive(Clone)]
 pub struct Database {
     pool: SqlitePool,
-    /// In-memory cache for server configs.
     config_cache: Arc<RwLock<HashMap<u64, ServerConfig>>>,
 }
 
 impl Database {
-    /// Create a new database connection.
-    ///
-    /// Creates the database file and initializes schema if needed.
+    /// Connects to SQLite at path, creating file if needed.
     pub async fn new(path: &str) -> Result<Self> {
         let db_path = Path::new(path);
 
@@ -113,7 +108,7 @@ impl Database {
         Ok(db)
     }
 
-    /// Create an in-memory database for testing.
+    /// In-memory database for tests.
     pub async fn in_memory() -> Result<Self> {
         let options = SqliteConnectOptions::new()
             .filename(":memory:")

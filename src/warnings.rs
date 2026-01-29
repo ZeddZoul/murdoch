@@ -29,7 +29,6 @@ pub enum WarningLevel {
 }
 
 impl WarningLevel {
-    /// Convert from database integer.
     pub fn from_i64(value: i64) -> Self {
         match value {
             0 => Self::None,
@@ -42,7 +41,6 @@ impl WarningLevel {
         }
     }
 
-    /// Get the next escalation level.
     pub fn escalate(self, kicked_before: bool) -> Self {
         match self {
             Self::None => Self::Warning,
@@ -60,7 +58,7 @@ impl WarningLevel {
         }
     }
 
-    /// Get the previous level (for decay).
+    /// Drops one level (bans don't decay).
     pub fn decay(self) -> Self {
         match self {
             Self::None => Self::None,
@@ -68,20 +66,18 @@ impl WarningLevel {
             Self::ShortTimeout => Self::Warning,
             Self::LongTimeout => Self::ShortTimeout,
             Self::Kick => Self::LongTimeout,
-            Self::Ban => Self::Ban, // Bans don't decay
+            Self::Ban => Self::Ban,
         }
     }
 
-    /// Get timeout duration in seconds (if applicable).
     pub fn timeout_duration_secs(&self) -> Option<u64> {
         match self {
-            Self::ShortTimeout => Some(600), // 10 minutes
-            Self::LongTimeout => Some(3600), // 1 hour
+            Self::ShortTimeout => Some(600),
+            Self::LongTimeout => Some(3600),
             _ => None,
         }
     }
 
-    /// Human-readable description.
     pub fn description(&self) -> &'static str {
         match self {
             Self::None => "No warnings",

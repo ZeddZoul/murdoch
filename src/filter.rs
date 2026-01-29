@@ -18,9 +18,6 @@ pub struct PatternSet {
 }
 
 impl PatternSet {
-    /// Create a new PatternSet from string patterns.
-    ///
-    /// Returns an error if any pattern fails to compile.
     pub fn new(
         slurs: &[String],
         invite_links: &[String],
@@ -33,7 +30,7 @@ impl PatternSet {
         })
     }
 
-    /// Create an empty PatternSet (matches nothing).
+    /// Empty set that matches nothing.
     pub fn empty() -> Result<Self> {
         Self::new(&[], &[], &[])
     }
@@ -45,17 +42,13 @@ pub struct RegexFilter {
 }
 
 impl RegexFilter {
-    /// Create a new RegexFilter with the given patterns.
     pub fn new(patterns: PatternSet) -> Self {
         Self {
             patterns: Arc::new(RwLock::new(patterns)),
         }
     }
 
-    /// Evaluate a message against all configured patterns.
-    ///
-    /// Returns `FilterResult::Violation` if any pattern matches,
-    /// or `FilterResult::Pass` if no patterns match.
+    /// Checks content against all patterns.
     pub fn evaluate(&self, content: &str) -> FilterResult {
         let patterns = self
             .patterns

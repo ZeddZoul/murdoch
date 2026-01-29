@@ -33,12 +33,10 @@ pub struct ConversationContext {
 }
 
 impl ConversationContext {
-    /// Create a new empty context.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Create context with server rules.
     pub fn with_rules(rules: String) -> Self {
         Self {
             recent_messages: Vec::new(),
@@ -99,14 +97,12 @@ impl Default for ContextTracker {
 }
 
 impl ContextTracker {
-    /// Create a new context tracker.
     pub fn new() -> Self {
         Self {
             channels: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
-    /// Add a message to the context.
     pub async fn add_message(&self, message: ContextMessage) {
         let mut channels = self.channels.write().await;
         let channel_messages = channels.entry(message.channel_id).or_default();
@@ -119,7 +115,6 @@ impl ContextTracker {
         }
     }
 
-    /// Get context for a channel.
     pub async fn get_context(
         &self,
         channel_id: u64,
@@ -137,19 +132,16 @@ impl ContextTracker {
         }
     }
 
-    /// Clear context for a channel.
     pub async fn clear_channel(&self, channel_id: u64) {
         let mut channels = self.channels.write().await;
         channels.remove(&channel_id);
     }
 
-    /// Clear all context.
     pub async fn clear_all(&self) {
         let mut channels = self.channels.write().await;
         channels.clear();
     }
 
-    /// Get the number of messages in a channel's context.
     pub async fn message_count(&self, channel_id: u64) -> usize {
         let channels = self.channels.read().await;
         channels.get(&channel_id).map(|m| m.len()).unwrap_or(0)

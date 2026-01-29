@@ -46,7 +46,6 @@ pub struct ModDirectorPipeline {
 }
 
 impl ModDirectorPipeline {
-    /// Create a new pipeline with all components.
     pub fn new(
         regex_filter: RegexFilter,
         message_buffer: MessageBuffer,
@@ -66,19 +65,16 @@ impl ModDirectorPipeline {
         }
     }
 
-    /// Create a new pipeline with rules engine.
     pub fn with_rules_engine(mut self, rules_engine: RulesEngine) -> Self {
         self.rules_engine = Some(Arc::new(rules_engine));
         self
     }
 
-    /// Add warning system to the pipeline.
     pub fn with_warning_system(mut self, warning_system: Arc<WarningSystem>) -> Self {
         self.warning_system = Some(warning_system);
         self
     }
 
-    /// Add WebSocket manager to the pipeline.
     pub fn with_websocket_manager(
         mut self,
         websocket_manager: Arc<crate::websocket::WebSocketManager>,
@@ -87,9 +83,8 @@ impl ModDirectorPipeline {
         self
     }
 
-    /// Process an incoming message through the pipeline.
+    /// Runs a message through regex → buffer → Gemini analysis.
     pub async fn process_message(&self, message: &Message) -> Result<()> {
-        // Add message to context tracker
         let context_msg = ContextMessage {
             message_id: message.id.get(),
             author_id: message.author.id.get(),
@@ -104,7 +99,6 @@ impl ModDirectorPipeline {
         };
         self.context_tracker.add_message(context_msg).await;
 
-        // Layer 1: Regex filter
         let filter_result = self.regex_filter.evaluate(&message.content);
 
         match filter_result {

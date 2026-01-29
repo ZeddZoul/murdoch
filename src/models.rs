@@ -55,7 +55,6 @@ impl SeverityLevel {
         }
     }
 
-    /// Get the string representation of the severity level.
     pub fn as_str(&self) -> &'static str {
         match self {
             SeverityLevel::High => "High",
@@ -65,14 +64,12 @@ impl SeverityLevel {
     }
 }
 
-/// Which layer detected the violation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DetectionLayer {
     RegexFilter,
     GeminiAnalyzer,
 }
 
-/// Complete report of a violation for logging and notification.
 #[derive(Debug, Clone)]
 pub struct ViolationReport {
     pub message_id: MessageId,
@@ -86,18 +83,15 @@ pub struct ViolationReport {
 }
 
 impl ViolationReport {
-    /// Check if all required fields are present (non-empty where applicable).
     pub fn is_complete(&self) -> bool {
         !self.reason.is_empty() && !self.content_hash.is_empty()
     }
 
-    /// Check if this is a high-severity violation requiring @mention.
     pub fn requires_mention(&self) -> bool {
         self.severity == SeverityLevel::High
     }
 }
 
-/// Type of pattern that matched in regex filtering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PatternType {
     Slur,

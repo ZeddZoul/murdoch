@@ -33,27 +33,19 @@ pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
 /// └─────────────────────────────────────────────────────────────┘
 /// ```
 pub struct MessageBuffer {
-    /// Primary buffer for incoming messages.
     primary: Arc<Mutex<Vec<BufferedMessage>>>,
-    /// Secondary buffer used during flush operations.
     secondary: Arc<Mutex<Vec<BufferedMessage>>>,
-    /// Timestamp of last flush.
     last_flush: Arc<Mutex<Instant>>,
-    /// Number of messages that triggers a flush.
     flush_threshold: usize,
-    /// Seconds before timeout triggers a flush.
     timeout_secs: u64,
-    /// Whether a flush is currently in progress.
     flushing: Arc<Mutex<bool>>,
 }
 
 impl MessageBuffer {
-    /// Create a new MessageBuffer with default thresholds.
     pub fn new() -> Self {
         Self::with_config(DEFAULT_FLUSH_THRESHOLD, DEFAULT_TIMEOUT_SECS)
     }
 
-    /// Create a new MessageBuffer with custom thresholds.
     pub fn with_config(flush_threshold: usize, timeout_secs: u64) -> Self {
         Self {
             primary: Arc::new(Mutex::new(Vec::new())),
@@ -65,10 +57,7 @@ impl MessageBuffer {
         }
     }
 
-    /// Add a message to the buffer.
-    ///
-    /// Returns `Some(FlushTrigger::CountThreshold)` if the buffer is now full.
-    /// During a flush, messages go to the secondary buffer.
+    /// Adds a message. Returns trigger if buffer is full.
     pub fn add(&self, message: BufferedMessage) -> Option<FlushTrigger> {
         let is_flushing = *self.flushing.lock().expect("flushing lock");
 
@@ -88,7 +77,7 @@ impl MessageBuffer {
         }
     }
 
-    /// Check if a flush should be triggered due to timeout.
+    /// Returns Some if timeout has elapsed and buffer isn't empty.
     pub fn should_flush(&self) -> Option<FlushTrigger> {
         let last = *self.last_flush.lock().expect("last_flush lock");
         let primary = self.primary.lock().expect("primary lock");
@@ -104,23 +93,13 @@ impl MessageBuffer {
         }
     }
 
-    /// Flush the buffer and return messages for processing.
-    ///
-    /// During flush:
-    /// 1. Sets flushing flag
-    /// 2. Swaps primary and secondary buffers
-    /// 3. Returns contents of old primary
-    /// 4. Clears flushing flag
-    ///
-    /// New messages arriving during flush go to secondary buffer.
+    /// Drains and returns buffered messages. New messages go to secondary buffer during flush.
     pub fn flush(&self) -> Vec<BufferedMessage> {
-        // Set flushing flag
         {
             let mut flushing = self.flushing.lock().expect("flushing lock");
             *flushing = true;
         }
 
-        // Get messages from primary
         let messages = {
             let mut primary = self.primary.lock().expect("primary lock");
             std::mem::take(&mut *primary)
@@ -145,9 +124,7 @@ impl MessageBuffer {
         messages
     }
 
-    /// Return messages to the buffer after a failed flush.
-    ///
-    /// Messages are prepended to maintain order.
+    /// Prepends messages back to buffer (for failed flush recovery).
     pub fn return_messages(&self, messages: Vec<BufferedMessage>) {
         let mut primary = self.primary.lock().expect("primary lock");
         let mut returned = messages;
@@ -155,17 +132,14 @@ impl MessageBuffer {
         *primary = returned;
     }
 
-    /// Get the current number of messages in the primary buffer.
     pub fn len(&self) -> usize {
         self.primary.lock().expect("primary lock").len()
     }
 
-    /// Check if the buffer is empty.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    /// Check if a flush is currently in progress.
     pub fn is_flushing(&self) -> bool {
         *self.flushing.lock().expect("flushing lock")
     }
