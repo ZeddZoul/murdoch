@@ -35,6 +35,10 @@ pub enum PendingAction {
     SendNotification {
         report: ViolationReport,
     },
+    SendSummaryNotification {
+        channel_id: ChannelId,
+        content: serde_json::Value,
+    },
     TimeoutUser {
         guild_id: GuildId,
         user_id: UserId,
@@ -76,6 +80,20 @@ impl DiscordClient {
         // Queue notification
         queue.push_back(PendingAction::SendNotification { report });
 
+        Ok(())
+    }
+
+    /// Queue a message deletion action.
+    pub async fn queue_delete_message(
+        &self,
+        channel_id: ChannelId,
+        message_id: MessageId,
+    ) -> Result<()> {
+        let mut queue = self.action_queue.lock().await;
+        queue.push_back(PendingAction::DeleteMessage {
+            channel_id,
+            message_id,
+        });
         Ok(())
     }
 
@@ -128,6 +146,16 @@ impl DiscordClient {
                 let content = self.build_notification(report);
                 self.http
                     .send_message(report.channel_id, vec![], &content)
+                    .await
+                    .map_err(|e| MurdochError::DiscordApi(Box::new(e)))?;
+            }
+            PendingAction::SendSummaryNotification {
+                channel_id,
+                content,
+            } => {
+                // Send summarized notification for multiple violations
+                self.http
+                    .send_message(*channel_id, vec![], content)
                     .await
                     .map_err(|e| MurdochError::DiscordApi(Box::new(e)))?;
             }
@@ -239,6 +267,120 @@ impl DiscordClient {
         );
 
         serde_json::json!({ "content": content })
+    }
+
+    /// Build a summarized notification for multiple violations by the same user.
+    pub fn build_summary_notification(
+        &self,
+        user_id: UserId,
+        channel_id: ChannelId,
+        violations: &[ViolationReport],
+        action_taken: &WarningLevel,
+    ) -> serde_json::Value {
+        let action_description = match action_taken {
+            WarningLevel::None => "No action taken",
+            WarningLevel::Warning => "Warning issued",
+            WarningLevel::ShortTimeout => "10-minute timeout",
+            WarningLevel::LongTimeout => "1-hour timeout",
+            WarningLevel::Kick => "Kicked from server",
+            WarningLevel::Ban => "Permanently banned",
+        };
+
+        let action_emoji = match action_taken {
+            WarningLevel::None | WarningLevel::Warning => "⚠️",
+            WarningLevel::ShortTimeout | WarningLevel::LongTimeout => "⏱️",
+            WarningLevel::Kick => "👢",
+            WarningLevel::Ban => "🔨",
+        };
+
+        // Get highest severity
+        let highest_severity = violations
+            .iter()
+            .map(|v| &v.severity)
+            .max_by_key(|s| match s {
+                SeverityLevel::High => 3,
+                SeverityLevel::Medium => 2,
+                SeverityLevel::Low => 1,
+            })
+            .unwrap_or(&SeverityLevel::Low);
+
+        let severity_emoji = match highest_severity {
+            SeverityLevel::High => "🔴",
+            SeverityLevel::Medium => "🟡",
+            SeverityLevel::Low => "🟢",
+        };
+
+        let mention = if violations.iter().any(|v| v.requires_mention()) {
+            self.mod_role_id
+                .map(|id| format!("<@&{}> ", id))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+
+        // Build violations list
+        let violations_list: Vec<String> = violations
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let v_emoji = match v.severity {
+                    SeverityLevel::High => "🔴",
+                    SeverityLevel::Medium => "🟡",
+                    SeverityLevel::Low => "🟢",
+                };
+                format!(
+                    "{}. {} **{}** - {}",
+                    i + 1,
+                    v_emoji,
+                    v.severity.as_str(),
+                    v.reason
+                )
+            })
+            .collect();
+
+        let content = format!(
+            "{}**{} Moderation Action Taken**\n\n\
+            **User:** <@{}>\n\
+            **Channel:** <#{}>\n\
+            **Action:** {} {}\n\
+            **Violations Found:** {}\n\
+            **Highest Severity:** {} {:?}\n\n\
+            **Violations Summary:**\n{}\n\n\
+            **Time:** <t:{}:F>",
+            mention,
+            action_emoji,
+            user_id,
+            channel_id,
+            action_emoji,
+            action_description,
+            violations.len(),
+            severity_emoji,
+            highest_severity,
+            violations_list.join("\n"),
+            Utc::now().timestamp()
+        );
+
+        serde_json::json!({ "content": content })
+    }
+
+    /// Queue a summarized notification for multiple violations.
+    pub async fn queue_summary_notification(
+        &self,
+        channel_id: ChannelId,
+        user_id: UserId,
+        violations: Vec<ViolationReport>,
+        action_taken: WarningLevel,
+    ) -> Result<()> {
+        let content =
+            self.build_summary_notification(user_id, channel_id, &violations, &action_taken);
+
+        let mut queue = self.action_queue.lock().await;
+        queue.push_back(PendingAction::SendSummaryNotification {
+            channel_id,
+            content,
+        });
+
+        Ok(())
     }
 
     /// Get the number of pending actions.

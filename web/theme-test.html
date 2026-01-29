@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Theme Test - Murdoch Dashboard</title>
+    <link rel="stylesheet" href="/css/styles.css">
+</head>
+<body>
+    <div style="padding: 2rem;">
+        <h1 style="color: var(--text-primary); margin-bottom: 1rem;">Theme System Test</h1>
+        
+        <button id="theme-toggle" style="padding: 0.5rem 1rem; background: var(--color-primary); color: var(--text-inverse); border: none; border-radius: 0.375rem; cursor: pointer; margin-bottom: 2rem;">
+            Toggle Theme
+        </button>
+
+        <div class="card" style="margin-bottom: 1rem;">
+            <h2 style="color: var(--text-primary); margin-bottom: 0.5rem;">Card Component</h2>
+            <p style="color: var(--text-secondary);">This is a test card using theme variables.</p>
+        </div>
+
+        <div style="display: flex; gap: 1rem; margin-bottom: 1rem;">
+            <button class="btn btn-primary">Primary Button</button>
+            <button class="btn btn-secondary">Secondary Button</button>
+            <button class="btn btn-danger">Danger Button</button>
+        </div>
+
+        <div style="display: flex; gap: 0.5rem; margin-bottom: 1rem;">
+            <span class="badge badge-low">Low</span>
+            <span class="badge badge-medium">Medium</span>
+            <span class="badge badge-high">High</span>
+            <span class="badge badge-critical">Critical</span>
+        </div>
+
+        <div class="form-group">
+            <label class="form-label">Test Input</label>
+            <input type="text" class="form-input" placeholder="Type something...">
+        </div>
+
+        <div style="margin-top: 2rem; padding: 1rem; background: var(--bg-tertiary); border-radius: 0.375rem;">
+            <h3 style="color: var(--text-primary); margin-bottom: 0.5rem;">Current Theme Variables</h3>
+            <pre style="color: var(--text-secondary); font-size: 0.875rem;">
+Background: var(--bg-primary)
+Text: var(--text-primary)
+Border: var(--border-primary)
+Primary: var(--color-primary)
+            </pre>
+        </div>
+    </div>
+
+    <script type="module">
+        import { themeManager } from './js/theme.js';
+        
+        console.log('Theme system initialized');
+        console.log('Current theme:', themeManager.getTheme());
+        
+        // Test theme toggle
+        document.getElementById('theme-toggle').addEventListener('click', () => {
+            themeManager.toggleTheme();
+            console.log('Theme toggled to:', themeManager.getTheme());
+        });
+    </script>
+</body>
+</html>

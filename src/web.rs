@@ -2,17 +2,22 @@
 //!
 //! Provides REST API endpoints for the web dashboard.
 
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use axum::{
-    extract::{Path, Query, State},
-    http::{header, HeaderMap, StatusCode},
+    extract::{Path, Query, Request, State},
+    http::{header, HeaderMap, Method, StatusCode, Uri},
     response::{IntoResponse, Redirect, Response},
     routing::{delete, get, post, put},
     Json, Router,
 };
 use chrono::{Datelike, Timelike};
+use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
+use tower::{Layer, Service};
 use tower_http::services::{ServeDir, ServeFile};
 
 use crate::database::Database;
@@ -26,6 +31,65 @@ const SESSION_COOKIE: &str = "murdoch_session";
 
 type ApiError = (StatusCode, Json<ErrorResponse>);
 
+/// Request logging middleware layer
+#[derive(Clone)]
+pub struct RequestLoggingLayer;
+
+impl<S> Layer<S> for RequestLoggingLayer {
+    type Service = RequestLoggingService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        RequestLoggingService { inner }
+    }
+}
+
+/// Service that logs all requests with method, path, status, and response time
+#[derive(Clone)]
+pub struct RequestLoggingService<S> {
+    inner: S,
+}
+
+impl<S> Service<Request> for RequestLoggingService<S>
+where
+    S: Service<Request, Response = Response> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
+    >;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: Request) -> Self::Future {
+        let method = req.method().clone();
+        let uri = req.uri().clone();
+        let start = std::time::Instant::now();
+
+        let mut inner = self.inner.clone();
+
+        Box::pin(async move {
+            let response = inner.call(req).await?;
+            let duration = start.elapsed();
+            let status = response.status();
+
+            // Log request with structured fields
+            tracing::info!(
+                method = %method,
+                path = %uri.path(),
+                status = %status.as_u16(),
+                duration_ms = %duration.as_millis(),
+                "HTTP request"
+            );
+
+            Ok(response)
+        })
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub db: Arc<Database>,
@@ -34,13 +98,283 @@ pub struct AppState {
     pub metrics: Arc<MetricsCollector>,
     pub rules_engine: Arc<RulesEngine>,
     pub warning_system: Arc<WarningSystem>,
+    pub user_service: Arc<crate::user_service::UserService>,
+    pub deduplicator: Arc<RequestDeduplicator>,
+    pub websocket_manager: Arc<crate::websocket::WebSocketManager>,
+    pub export_service: Arc<crate::export::ExportService>,
+    pub notification_service: Arc<crate::notification::NotificationService>,
     pub dashboard_url: String,
     pub client_id: String,
+}
+
+/// Request deduplication service that shares futures for identical in-flight requests.
+///
+/// This prevents duplicate API calls when multiple clients request the same data simultaneously.
+/// Uses DashMap for lock-free concurrent access and oneshot channels to share results.
+pub struct RequestDeduplicator {
+    /// In-flight requests keyed by (method, path, params_hash)
+    in_flight: Arc<DashMap<String, tokio::sync::broadcast::Sender<Result<Vec<u8>, String>>>>,
+    /// Metrics tracking
+    deduplicated_count: Arc<AtomicU64>,
+    total_requests: Arc<AtomicU64>,
+}
+
+impl RequestDeduplicator {
+    pub fn new() -> Self {
+        Self {
+            in_flight: Arc::new(DashMap::new()),
+            deduplicated_count: Arc::new(AtomicU64::new(0)),
+            total_requests: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Generate a unique key for a request based on method, path, and query parameters
+    fn request_key(method: &Method, uri: &Uri) -> String {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = DefaultHasher::new();
+        method.as_str().hash(&mut hasher);
+        uri.path().hash(&mut hasher);
+        if let Some(query) = uri.query() {
+            query.hash(&mut hasher);
+        }
+        let hash = hasher.finish();
+
+        format!("{}:{}:{:x}", method.as_str(), uri.path(), hash)
+    }
+
+    /// Execute a request with deduplication.
+    ///
+    /// If an identical request is already in-flight, this will wait for and return
+    /// the same result. Otherwise, it executes the provided future and shares the
+    /// result with any concurrent identical requests.
+    pub async fn deduplicate<F, T>(
+        &self,
+        method: &Method,
+        uri: &Uri,
+        future: F,
+    ) -> Result<T, String>
+    where
+        F: std::future::Future<Output = Result<T, String>>,
+        T: Clone + serde::Serialize + for<'de> serde::Deserialize<'de>,
+    {
+        self.total_requests.fetch_add(1, Ordering::Relaxed);
+
+        let key = Self::request_key(method, uri);
+
+        // Try to get existing in-flight request
+        if let Some(tx) = self.in_flight.get(&key) {
+            // Request is already in-flight, subscribe to its result
+            self.deduplicated_count.fetch_add(1, Ordering::Relaxed);
+            let mut rx = tx.subscribe();
+
+            // Wait for the result
+            match rx.recv().await {
+                Ok(Ok(bytes)) => {
+                    // Deserialize the shared result
+                    serde_json::from_slice(&bytes)
+                        .map_err(|e| format!("Deserialization error: {}", e))
+                }
+                Ok(Err(e)) => Err(e),
+                Err(_) => Err("Channel closed".to_string()),
+            }
+        } else {
+            // No in-flight request, create a new broadcast channel
+            let (tx, _rx) = tokio::sync::broadcast::channel(16);
+            self.in_flight.insert(key.clone(), tx.clone());
+
+            // Execute the future
+            let result = future.await;
+
+            // Serialize the result for sharing
+            let broadcast_result = match &result {
+                Ok(value) => match serde_json::to_vec(value) {
+                    Ok(bytes) => Ok(bytes),
+                    Err(e) => Err(format!("Serialization error: {}", e)),
+                },
+                Err(e) => Err(e.clone()),
+            };
+
+            // Broadcast the result to any waiting subscribers
+            let _ = tx.send(broadcast_result);
+
+            // Remove from in-flight map
+            self.in_flight.remove(&key);
+
+            result
+        }
+    }
+
+    /// Get deduplication statistics
+    pub fn stats(&self) -> DeduplicationStats {
+        let total = self.total_requests.load(Ordering::Relaxed);
+        let deduplicated = self.deduplicated_count.load(Ordering::Relaxed);
+        let hit_rate = if total > 0 {
+            (deduplicated as f64 / total as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        DeduplicationStats {
+            total_requests: total,
+            deduplicated_requests: deduplicated,
+            hit_rate,
+            in_flight_count: self.in_flight.len() as u64,
+        }
+    }
+}
+
+impl Default for RequestDeduplicator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DeduplicationStats {
+    pub total_requests: u64,
+    pub deduplicated_requests: u64,
+    pub hit_rate: f64,
+    pub in_flight_count: u64,
+}
+
+/// Middleware layer for request deduplication
+#[derive(Clone)]
+pub struct DeduplicationLayer {
+    deduplicator: Arc<RequestDeduplicator>,
+}
+
+impl DeduplicationLayer {
+    pub fn new(deduplicator: Arc<RequestDeduplicator>) -> Self {
+        Self { deduplicator }
+    }
+}
+
+impl<S> Layer<S> for DeduplicationLayer {
+    type Service = DeduplicationService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        DeduplicationService {
+            inner,
+            deduplicator: self.deduplicator.clone(),
+        }
+    }
+}
+
+/// Service that performs request deduplication
+#[derive(Clone)]
+pub struct DeduplicationService<S> {
+    inner: S,
+    deduplicator: Arc<RequestDeduplicator>,
+}
+
+impl<S> Service<Request> for DeduplicationService<S>
+where
+    S: Service<Request, Response = Response> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
+    >;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: Request) -> Self::Future {
+        let method = req.method().clone();
+        let uri = req.uri().clone();
+
+        // Only deduplicate GET requests
+        if method != Method::GET {
+            let future = self.inner.call(req);
+            return Box::pin(future);
+        }
+
+        let deduplicator = self.deduplicator.clone();
+        let mut inner = self.inner.clone();
+
+        Box::pin(async move {
+            deduplicator.total_requests.fetch_add(1, Ordering::Relaxed);
+
+            let key = RequestDeduplicator::request_key(&method, &uri);
+
+            // Try to get existing in-flight request
+            if let Some(tx) = deduplicator.in_flight.get(&key) {
+                // Request is already in-flight, subscribe to its result
+                deduplicator
+                    .deduplicated_count
+                    .fetch_add(1, Ordering::Relaxed);
+                let mut rx = tx.subscribe();
+
+                // Wait for the result
+                match rx.recv().await {
+                    Ok(Ok(bytes)) => {
+                        // Reconstruct response from bytes
+                        Ok(Response::builder()
+                            .status(StatusCode::OK)
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .body(axum::body::Body::from(bytes))
+                            .unwrap())
+                    }
+                    Ok(Err(_)) | Err(_) => {
+                        // If broadcast failed, execute the request normally
+                        inner.call(req).await
+                    }
+                }
+            } else {
+                // No in-flight request, create a new broadcast channel
+                let (tx, _rx) = tokio::sync::broadcast::channel(16);
+                deduplicator.in_flight.insert(key.clone(), tx.clone());
+
+                // Execute the request
+                let response = inner.call(req).await?;
+
+                // Extract response body for broadcasting
+                let (parts, body) = response.into_parts();
+                let bytes = axum::body::to_bytes(body, usize::MAX)
+                    .await
+                    .unwrap_or_default();
+
+                // Broadcast the result to any waiting subscribers
+                let _ = tx.send(Ok(bytes.to_vec()));
+
+                // Remove from in-flight map
+                deduplicator.in_flight.remove(&key);
+
+                // Reconstruct and return the response
+                Ok(Response::from_parts(parts, axum::body::Body::from(bytes)))
+            }
+        })
+    }
 }
 
 #[derive(Serialize)]
 pub struct ErrorResponse {
     pub error: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+}
+
+impl ErrorResponse {
+    /// Create a new error response with just a message
+    pub fn new(error: impl Into<String>) -> Self {
+        Self {
+            error: error.into(),
+            request_id: None,
+        }
+    }
+
+    /// Create an error response with a request ID for tracking
+    pub fn with_request_id(error: impl Into<String>, request_id: impl Into<String>) -> Self {
+        Self {
+            error: error.into(),
+            request_id: Some(request_id.into()),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -56,6 +390,7 @@ pub struct ServerInfo {
     pub id: String,
     pub name: String,
     pub icon: Option<String>,
+    pub bot_present: bool,
 }
 
 #[derive(Deserialize)]
@@ -121,41 +456,72 @@ pub struct ViolationEntry {
 }
 
 #[derive(Serialize)]
+pub struct ViolationEntryWithUser {
+    pub id: String,
+    pub user_id: String,
+    pub username: Option<String>,
+    pub avatar: Option<String>,
+    pub message_id: String,
+    pub reason: String,
+    pub severity: String,
+    pub detection_type: String,
+    pub action_taken: String,
+    pub timestamp: String,
+}
+
+#[derive(Serialize)]
 pub struct ViolationsResponse {
-    pub violations: Vec<ViolationEntry>,
+    pub violations: Vec<ViolationEntryWithUser>,
     pub total: u64,
     pub page: u32,
     pub per_page: u32,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Default)]
 pub struct HealthMetrics {
+    #[serde(default)]
     pub health_score: u8,
+    #[serde(default)]
     pub violation_rate: f64,
+    #[serde(default)]
     pub action_distribution: ActionDistribution,
+    #[serde(default)]
     pub trends: TrendIndicators,
+    #[serde(default)]
     pub warning: bool,
+    #[serde(default)]
+    pub limited_data: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Default)]
 pub struct ActionDistribution {
+    #[serde(default)]
     pub warnings_pct: f64,
+    #[serde(default)]
     pub timeouts_pct: f64,
+    #[serde(default)]
     pub kicks_pct: f64,
+    #[serde(default)]
     pub bans_pct: f64,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Default)]
 pub struct TrendIndicators {
+    #[serde(default)]
     pub messages_change_pct: f64,
+    #[serde(default)]
     pub violations_change_pct: f64,
+    #[serde(default)]
     pub health_change: i8,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Default)]
 pub struct TopOffendersResponse {
+    #[serde(default)]
     pub top_users: Vec<OffenderEntry>,
+    #[serde(default)]
     pub violation_distribution: std::collections::HashMap<u32, u32>,
+    #[serde(default)]
     pub moderated_users_pct: f64,
 }
 
@@ -168,9 +534,11 @@ pub struct OffenderEntry {
     pub last_violation: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Default)]
 pub struct RuleEffectivenessResponse {
+    #[serde(default)]
     pub top_rules: Vec<RuleStats>,
+    #[serde(default)]
     pub total_rule_violations: u64,
 }
 
@@ -186,11 +554,15 @@ pub struct RuleEffectivenessQuery {
     pub period: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Default)]
 pub struct TemporalAnalytics {
+    #[serde(default)]
     pub heatmap: Vec<HeatmapCell>,
+    #[serde(default)]
     pub peak_times: Vec<PeakTime>,
+    #[serde(default)]
     pub major_events: Vec<ModerationEvent>,
+    #[serde(default)]
     pub avg_violations_per_hour: f64,
 }
 
@@ -214,6 +586,27 @@ pub struct ModerationEvent {
     pub event_type: String,
     pub description: String,
     pub violation_count: u32,
+    pub user_ids: Option<Vec<String>>,
+    pub usernames: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+pub struct ExportRequest {
+    pub export_type: String,
+    pub format: String,
+}
+
+#[derive(Serialize)]
+pub struct ExportResponse {
+    pub file_path: String,
+    pub file_size: u64,
+    pub record_count: usize,
+    pub download_url: String,
+}
+
+#[derive(Deserialize)]
+pub struct ExportHistoryQuery {
+    pub limit: Option<u32>,
 }
 
 fn error_response(status: StatusCode, msg: &str) -> ApiError {
@@ -221,7 +614,74 @@ fn error_response(status: StatusCode, msg: &str) -> ApiError {
         status,
         Json(ErrorResponse {
             error: msg.to_string(),
+            request_id: None,
         }),
+    )
+}
+
+/// Convert MurdochError to user-friendly API error with logging
+///
+/// This function:
+/// - Logs the error with full context using tracing
+/// - Returns a user-friendly message (hiding internal details)
+/// - Includes request ID for correlation
+/// - Triggers critical alerts if needed
+#[allow(dead_code)]
+fn handle_error(
+    error: crate::error::MurdochError,
+    context: crate::error::ErrorContext,
+    notification_service: Option<&Arc<crate::notification::NotificationService>>,
+) -> ApiError {
+    // Log error with full context
+    error.log_with_context(&context);
+
+    // Trigger critical alert if needed
+    if error.is_critical() {
+        if let Some(service) = notification_service {
+            if let Some(guild_id) = context.guild_id {
+                let notification = crate::notification::Notification {
+                    guild_id,
+                    user_id: None,
+                    event_type: crate::notification::NotificationEventType::BotOffline,
+                    title: "Critical Error".to_string(),
+                    message: format!("Critical error in operation: {}", context.operation),
+                    priority: crate::notification::NotificationPriority::Critical,
+                    link: None,
+                };
+
+                // Fire and forget - don't block on notification
+                let service = service.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = service.send(notification).await {
+                        tracing::warn!("Failed to send critical error notification: {}", e);
+                    }
+                });
+            }
+        }
+    }
+
+    // Determine HTTP status code
+    let status = match &error {
+        crate::error::MurdochError::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
+        crate::error::MurdochError::OAuth(_) => StatusCode::UNAUTHORIZED,
+        crate::error::MurdochError::Config(_) | crate::error::MurdochError::RegexPattern(_) => {
+            StatusCode::BAD_REQUEST
+        }
+        crate::error::MurdochError::Database(_)
+        | crate::error::MurdochError::InternalState(_)
+        | crate::error::MurdochError::Backup(_) => StatusCode::SERVICE_UNAVAILABLE,
+        crate::error::MurdochError::GeminiApi(_)
+        | crate::error::MurdochError::DiscordApi(_)
+        | crate::error::MurdochError::Http(_) => StatusCode::BAD_GATEWAY,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+
+    (
+        status,
+        Json(ErrorResponse::with_request_id(
+            error.user_message(),
+            context.request_id,
+        )),
     )
 }
 
@@ -245,6 +705,12 @@ fn get_session_id(headers: &HeaderMap) -> Option<String> {
 }
 
 pub fn build_router(state: AppState) -> Router {
+    // Create deduplication layer
+    let dedup_layer = DeduplicationLayer::new(state.deduplicator.clone());
+
+    // Create request logging layer
+    let logging_layer = RequestLoggingLayer;
+
     // Create API router with all endpoints
     let api_router = Router::new()
         .route("/api/auth/login", get(auth_login))
@@ -271,9 +737,10 @@ pub fn build_router(state: AppState) -> Router {
             post(bulk_clear_warnings),
         )
         .route("/api/servers/{guild_id}/violations", get(get_violations))
+        .route("/api/servers/{guild_id}/export", post(create_export))
         .route(
-            "/api/servers/{guild_id}/violations/export",
-            get(export_violations),
+            "/api/servers/{guild_id}/export/history",
+            get(get_export_history),
         )
         .route("/api/servers/{guild_id}/audit-log", get(get_audit_log))
         .route(
@@ -288,6 +755,30 @@ pub fn build_router(state: AppState) -> Router {
             "/api/servers/{guild_id}/temporal-analytics",
             get(get_temporal_analytics),
         )
+        .route(
+            "/api/servers/{guild_id}/notifications",
+            get(get_notifications),
+        )
+        .route(
+            "/api/servers/{guild_id}/notifications/{notification_id}/read",
+            post(mark_notification_read),
+        )
+        .route(
+            "/api/servers/{guild_id}/notifications/{notification_id}/unread",
+            post(mark_notification_unread),
+        )
+        .route(
+            "/api/servers/{guild_id}/notification-preferences",
+            get(get_notification_preferences),
+        )
+        .route(
+            "/api/servers/{guild_id}/notification-preferences",
+            put(update_notification_preferences),
+        )
+        .route("/api/deduplication/stats", get(get_deduplication_stats))
+        .route("/ws", get(websocket_handler))
+        .layer(logging_layer)
+        .layer(dedup_layer)
         .with_state(state);
 
     // Serve static files from web/ directory with SPA fallback
@@ -415,14 +906,27 @@ async fn list_servers(
 
     tracing::info!("Found {} admin guilds", guilds.len());
 
-    let servers: Vec<ServerInfo> = guilds
-        .into_iter()
-        .map(|g| ServerInfo {
+    // Check which guilds have bot data (violations, config, etc.)
+    let mut servers: Vec<ServerInfo> = Vec::new();
+    for g in guilds {
+        let guild_id: i64 = g.id.parse().unwrap_or(0);
+
+        // Check if guild has any violations (indicates bot is/was active)
+        let has_data: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM violations WHERE guild_id = ? LIMIT 1)",
+        )
+        .bind(guild_id)
+        .fetch_one(state.db.pool())
+        .await
+        .unwrap_or(false);
+
+        servers.push(ServerInfo {
             id: g.id,
             name: g.name,
             icon: g.icon,
-        })
-        .collect();
+            bot_present: has_data,
+        });
+    }
 
     Ok(Json(serde_json::json!({ "servers": servers })))
 }
@@ -475,7 +979,14 @@ async fn get_metrics(
         .metrics
         .get_snapshot(guild_id_u64, period)
         .await
-        .map_err(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "Failed to get metrics"))?;
+        .unwrap_or_else(|_| {
+            // Return default empty snapshot on error
+            crate::metrics::MetricsSnapshot {
+                guild_id: guild_id_u64,
+                period: period.to_string(),
+                ..Default::default()
+            }
+        });
 
     // Build time series data from metrics_hourly table
     let time_filter = match period {
@@ -501,17 +1012,50 @@ async fn get_metrics(
         .await
         .unwrap_or_default();
 
-    let time_series: Vec<serde_json::Value> = time_series_rows
-        .iter()
-        .map(|row| {
-            use sqlx::Row;
-            serde_json::json!({
-                "timestamp": row.get::<String, _>("timestamp"),
-                "messages": row.get::<i64, _>("messages"),
-                "violations": row.get::<i64, _>("violations"),
+    // If metrics_hourly is empty, build time series from violations table
+    let time_series: Vec<serde_json::Value> = if time_series_rows.is_empty() {
+        // Fallback: aggregate violations by hour from violations table
+        let violations_time_series_sql = format!(
+            "SELECT strftime('%Y-%m-%d %H:00:00', timestamp) as timestamp,
+                    0 as messages,
+                    COUNT(*) as violations
+             FROM violations
+             WHERE guild_id = ? AND timestamp >= {}
+             GROUP BY strftime('%Y-%m-%d %H:00:00', timestamp)
+             ORDER BY timestamp ASC",
+            time_filter
+        );
+
+        let fallback_rows = sqlx::query(&violations_time_series_sql)
+            .bind(guild_id_u64 as i64)
+            .fetch_all(state.db.pool())
+            .await
+            .unwrap_or_default();
+
+        fallback_rows
+            .iter()
+            .map(|row| {
+                use sqlx::Row;
+                serde_json::json!({
+                    "timestamp": row.get::<String, _>("timestamp"),
+                    "messages": row.get::<i64, _>("messages"),
+                    "violations": row.get::<i64, _>("violations"),
+                })
             })
-        })
-        .collect();
+            .collect()
+    } else {
+        time_series_rows
+            .iter()
+            .map(|row| {
+                use sqlx::Row;
+                serde_json::json!({
+                    "timestamp": row.get::<String, _>("timestamp"),
+                    "messages": row.get::<i64, _>("messages"),
+                    "violations": row.get::<i64, _>("violations"),
+                })
+            })
+            .collect()
+    };
 
     Ok(Json(serde_json::json!({
         "period": period,
@@ -540,7 +1084,14 @@ async fn get_health(
         .metrics
         .get_snapshot(guild_id_u64, "day")
         .await
-        .map_err(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "Failed to get metrics"))?;
+        .unwrap_or_else(|_| {
+            // Return default empty snapshot on error
+            crate::metrics::MetricsSnapshot {
+                guild_id: guild_id_u64,
+                period: "day".to_string(),
+                ..Default::default()
+            }
+        });
 
     // Get previous period metrics (24-48 hours ago)
     let previous_start = chrono::Utc::now() - chrono::Duration::days(2);
@@ -548,22 +1099,9 @@ async fn get_health(
         .metrics
         .query_historical(guild_id_u64, previous_start)
         .await
-        .map_err(|_| {
-            error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to get previous metrics",
-            )
-        })?;
+        .unwrap_or_default();
 
-    // Calculate violation rate per 1000 messages
-    let violation_rate = if current_snapshot.messages_processed > 0 {
-        (current_snapshot.violations_total as f64 / current_snapshot.messages_processed as f64)
-            * 1000.0
-    } else {
-        0.0
-    };
-
-    // Query action distribution from violations table
+    // Query action distribution from violations table FIRST to get total_actions count
     let action_rows = sqlx::query(
         "SELECT action_taken, COUNT(*) as count
          FROM violations
@@ -573,24 +1111,49 @@ async fn get_health(
     .bind(guild_id_u64 as i64)
     .fetch_all(state.db.pool())
     .await
-    .map_err(|e| {
-        tracing::error!("Failed to query action distribution: {}", e);
-        error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to calculate action distribution",
-        )
-    })?;
+    .unwrap_or_default();
 
     let mut action_counts = std::collections::HashMap::new();
     let mut total_actions = 0u64;
 
-    for row in action_rows {
+    for row in &action_rows {
         use sqlx::Row;
         let action: String = row.get("action_taken");
         let count: i64 = row.get("count");
-        action_counts.insert(action, count as u64);
+
+        // Normalize action names to match expected keys
+        // Database has: "Warning issued", "10-minute timeout", "1-hour timeout", "Kicked from server", "Permanently banned"
+        let normalized_action = if action.to_lowercase().contains("warning") {
+            "warning"
+        } else if action.to_lowercase().contains("timeout") {
+            "timeout"
+        } else if action.to_lowercase().contains("kick") {
+            "kick"
+        } else if action.to_lowercase().contains("ban") {
+            "ban"
+        } else {
+            "other"
+        };
+
+        *action_counts
+            .entry(normalized_action.to_string())
+            .or_insert(0) += count as u64;
         total_actions += count as u64;
     }
+
+    // Calculate violation rate per 1000 messages
+    // When no message tracking available, estimate based on typical server activity
+    let violation_rate = if current_snapshot.messages_processed > 0 {
+        (current_snapshot.violations_total as f64 / current_snapshot.messages_processed as f64)
+            * 1000.0
+    } else if total_actions > 0 {
+        // Fallback: use total_actions from the database when in-memory counter is 0
+        // This happens after bot restart. Estimate ~100 messages per hour baseline.
+        let estimated_messages = 2400.0; // ~100 msgs/hour * 24 hours
+        (total_actions as f64 / estimated_messages) * 1000.0
+    } else {
+        0.0
+    };
 
     // Calculate action distribution percentages
     let action_distribution = if total_actions > 0 {
@@ -607,12 +1170,7 @@ async fn get_health(
                 * 100.0,
         }
     } else {
-        ActionDistribution {
-            warnings_pct: 0.0,
-            timeouts_pct: 0.0,
-            kicks_pct: 0.0,
-            bans_pct: 0.0,
-        }
+        ActionDistribution::default()
     };
 
     // Calculate escalation rate (kicks + bans / total actions)
@@ -623,12 +1181,27 @@ async fn get_health(
         0.0
     };
 
-    // Calculate health score
-    let health_score = calculate_health_score(
-        violation_rate,
-        current_snapshot.avg_response_time_ms,
-        escalation_rate,
-    );
+    // Use the higher of snapshot violations or direct DB count for health calculation
+    let actual_violations = std::cmp::max(current_snapshot.violations_total, total_actions);
+
+    // Calculate health score - if no violations, return perfect score
+    let health_score = if actual_violations == 0 {
+        100
+    } else {
+        // Recalculate violation rate using actual violations if needed
+        let effective_violation_rate = if current_snapshot.messages_processed > 0 {
+            (actual_violations as f64 / current_snapshot.messages_processed as f64) * 1000.0
+        } else {
+            // If no message count, use a default rate based on violation count
+            // Assume ~100 messages per violation as a baseline
+            actual_violations as f64 * 10.0
+        };
+        calculate_health_score(
+            effective_violation_rate,
+            current_snapshot.avg_response_time_ms,
+            escalation_rate,
+        )
+    };
 
     // Calculate previous period violation rate for trend
     let previous_violation_rate = if previous_counters.messages_processed > 0 {
@@ -640,11 +1213,15 @@ async fn get_health(
 
     // Calculate previous health score for trend
     let previous_escalation_rate = 0.0; // Simplified - would need to query previous actions
-    let previous_health_score = calculate_health_score(
-        previous_violation_rate,
-        previous_counters.avg_response_time_ms(),
-        previous_escalation_rate,
-    );
+    let previous_health_score = if previous_counters.total_violations() == 0 {
+        100
+    } else {
+        calculate_health_score(
+            previous_violation_rate,
+            previous_counters.avg_response_time_ms(),
+            previous_escalation_rate,
+        )
+    };
 
     // Calculate trend indicators
     let messages_change_pct = if previous_counters.messages_processed > 0 {
@@ -674,12 +1251,16 @@ async fn get_health(
     // Check if warning flag should be set
     let warning = health_score < 70;
 
+    // Check if we have limited data (no message tracking or less than 10 messages processed)
+    let limited_data = current_snapshot.messages_processed < 10;
+
     Ok(Json(HealthMetrics {
         health_score,
         violation_rate,
         action_distribution,
         trends,
         warning,
+        limited_data,
     }))
 }
 
@@ -737,6 +1318,17 @@ async fn update_rules(
         .create_audit_log(guild_id_u64, &session.user_id, "rules_updated", None)
         .await;
 
+    // Broadcast config update event to WebSocket clients
+    let event = crate::websocket::WsEvent::ConfigUpdate(crate::websocket::ConfigUpdate {
+        guild_id: guild_id.clone(),
+        updated_by: session.username.clone(),
+        changes: vec!["rules_updated".to_string()],
+    });
+
+    if let Err(e) = state.websocket_manager.broadcast_to_guild(&guild_id, event) {
+        tracing::error!("Failed to broadcast config update: {}", e);
+    }
+
     Ok(Json(serde_json::json!({"success": true})))
 }
 
@@ -761,6 +1353,17 @@ async fn delete_rules(
         .db
         .create_audit_log(guild_id_u64, &session.user_id, "rules_cleared", None)
         .await;
+
+    // Broadcast config update event to WebSocket clients
+    let event = crate::websocket::WsEvent::ConfigUpdate(crate::websocket::ConfigUpdate {
+        guild_id: guild_id.clone(),
+        updated_by: session.username.clone(),
+        changes: vec!["rules_cleared".to_string()],
+    });
+
+    if let Err(e) = state.websocket_manager.broadcast_to_guild(&guild_id, event) {
+        tracing::error!("Failed to broadcast config update: {}", e);
+    }
 
     Ok(Json(serde_json::json!({"success": true})))
 }
@@ -847,6 +1450,31 @@ async fn update_config(
         .db
         .create_audit_log(guild_id_u64, &session.user_id, "config_updated", None)
         .await;
+
+    // Broadcast config update event to WebSocket clients
+    let mut changes = Vec::new();
+    if req.severity_threshold.is_some() {
+        changes.push("severity_threshold".to_string());
+    }
+    if req.buffer_timeout_secs.is_some() {
+        changes.push("buffer_timeout_secs".to_string());
+    }
+    if req.buffer_threshold.is_some() {
+        changes.push("buffer_threshold".to_string());
+    }
+    if req.mod_role_id.is_some() {
+        changes.push("mod_role_id".to_string());
+    }
+
+    let event = crate::websocket::WsEvent::ConfigUpdate(crate::websocket::ConfigUpdate {
+        guild_id: guild_id.clone(),
+        updated_by: session.username.clone(),
+        changes,
+    });
+
+    if let Err(e) = state.websocket_manager.broadcast_to_guild(&guild_id, event) {
+        tracing::error!("Failed to broadcast config update: {}", e);
+    }
 
     Ok(Json(serde_json::json!({"success": true})))
 }
@@ -1113,13 +1741,37 @@ async fn get_violations(
         )
     })?;
 
-    let violations: Vec<ViolationEntry> = rows
+    // Extract user IDs for batch fetching
+    let user_ids: Vec<u64> = rows
+        .iter()
+        .map(|row| {
+            use sqlx::Row;
+            row.get::<i64, _>("user_id") as u64
+        })
+        .collect();
+
+    // Batch fetch user information
+    let user_info_map = state
+        .user_service
+        .get_users_batch(user_ids)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!("Failed to batch fetch user info: {}", e);
+            std::collections::HashMap::new()
+        });
+
+    let violations: Vec<ViolationEntryWithUser> = rows
         .into_iter()
         .map(|row| {
             use sqlx::Row;
-            ViolationEntry {
+            let user_id = row.get::<i64, _>("user_id") as u64;
+            let user_info = user_info_map.get(&user_id);
+
+            ViolationEntryWithUser {
                 id: row.get("id"),
-                user_id: row.get::<i64, _>("user_id").to_string(),
+                user_id: user_id.to_string(),
+                username: user_info.map(|u| u.username.clone()),
+                avatar: user_info.and_then(|u| u.avatar.clone()),
                 message_id: row.get::<i64, _>("message_id").to_string(),
                 reason: row.get("reason"),
                 severity: row.get("severity"),
@@ -1138,102 +1790,91 @@ async fn get_violations(
     }))
 }
 
-async fn export_violations(
+async fn create_export(
     State(state): State<AppState>,
     Path(guild_id): Path<String>,
-    Query(query): Query<ViolationsQuery>,
     headers: HeaderMap,
-) -> Result<Response, ApiError> {
-    let _ = verify_guild_admin(&state, &headers, &guild_id).await?;
+    Json(req): Json<ExportRequest>,
+) -> Result<Json<ExportResponse>, ApiError> {
+    let session = get_session(&state, &headers).await?;
 
     let guild_id_u64: u64 = guild_id
         .parse()
         .map_err(|_| error_response(StatusCode::BAD_REQUEST, "Invalid guild ID"))?;
 
-    // Build query with filters (no pagination for export)
-    let mut sql = String::from(
-        "SELECT id, user_id, guild_id, message_id, reason, severity, detection_type, action_taken, timestamp
-         FROM violations WHERE guild_id = ?"
-    );
+    let user_id_u64: u64 = session
+        .user_id
+        .parse()
+        .map_err(|_| error_response(StatusCode::BAD_REQUEST, "Invalid user ID"))?;
 
-    if query.severity.is_some() {
-        sql.push_str(" AND severity = ?");
-    }
+    // Parse export type
+    let export_type = req
+        .export_type
+        .parse()
+        .map_err(|e: String| error_response(StatusCode::BAD_REQUEST, &e))?;
 
-    if query.detection_type.is_some() {
-        sql.push_str(" AND detection_type = ?");
-    }
+    // Parse format
+    let format = req
+        .format
+        .parse()
+        .map_err(|e: String| error_response(StatusCode::BAD_REQUEST, &e))?;
 
-    if query.user_id.is_some() {
-        sql.push_str(" AND user_id = ?");
-    }
-
-    sql.push_str(" ORDER BY timestamp DESC");
-
-    let mut data_query = sqlx::query(&sql).bind(guild_id_u64 as i64);
-
-    if let Some(ref severity) = query.severity {
-        data_query = data_query.bind(severity);
-    }
-    if let Some(ref detection_type) = query.detection_type {
-        data_query = data_query.bind(detection_type);
-    }
-    if let Some(ref user_id) = query.user_id {
-        let user_id_i64: i64 = user_id.parse().unwrap_or(0);
-        data_query = data_query.bind(user_id_i64);
-    }
-
-    let rows = data_query.fetch_all(state.db.pool()).await.map_err(|e| {
-        tracing::error!("Failed to fetch violations for export: {}", e);
-        error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to fetch violations",
+    // Perform export
+    let result = state
+        .export_service
+        .export(
+            serenity::model::id::GuildId::new(guild_id_u64),
+            export_type,
+            format,
+            serenity::model::id::UserId::new(user_id_u64),
         )
-    })?;
+        .await
+        .map_err(|e| {
+            tracing::error!("Export failed: {}", e);
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "Export failed")
+        })?;
 
-    // Generate CSV
-    let mut csv = String::from(
-        "ID,User ID,Message ID,Reason,Severity,Detection Type,Action Taken,Timestamp\n",
+    // Generate download URL
+    let download_url = format!(
+        "/api/servers/{}/export/download/{}",
+        guild_id, result.file_path
     );
 
-    for row in rows {
-        use sqlx::Row;
-        let id: String = row.get("id");
-        let user_id: i64 = row.get("user_id");
-        let message_id: i64 = row.get("message_id");
-        let reason: String = row.get("reason");
-        let severity: String = row.get("severity");
-        let detection_type: String = row.get("detection_type");
-        let action_taken: String = row.get("action_taken");
-        let timestamp: String = row.get("timestamp");
+    Ok(Json(ExportResponse {
+        file_path: result.file_path,
+        file_size: result.file_size,
+        record_count: result.record_count,
+        download_url,
+    }))
+}
 
-        // Escape CSV fields
-        let reason_escaped = reason.replace('"', "\"\"");
+async fn get_export_history(
+    State(state): State<AppState>,
+    Path(guild_id): Path<String>,
+    Query(query): Query<ExportHistoryQuery>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<crate::export::ExportRecord>>, ApiError> {
+    let _ = get_session(&state, &headers).await?;
 
-        csv.push_str(&format!(
-            "{},{},{},\"{}\",{},{},{},{}\n",
-            id,
-            user_id,
-            message_id,
-            reason_escaped,
-            severity,
-            detection_type,
-            action_taken,
-            timestamp
-        ));
-    }
+    let guild_id_u64: u64 = guild_id
+        .parse()
+        .map_err(|_| error_response(StatusCode::BAD_REQUEST, "Invalid guild ID"))?;
 
-    Ok((
-        [
-            (header::CONTENT_TYPE, "text/csv"),
-            (
-                header::CONTENT_DISPOSITION,
-                "attachment; filename=\"violations.csv\"",
-            ),
-        ],
-        csv,
-    )
-        .into_response())
+    let limit = query.limit.unwrap_or(50);
+
+    let history = state
+        .export_service
+        .get_export_history(serenity::model::id::GuildId::new(guild_id_u64), limit)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to get export history: {}", e);
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to get export history",
+            )
+        })?;
+
+    Ok(Json(history))
 }
 
 async fn get_top_offenders(
@@ -1259,16 +1900,28 @@ async fn get_top_offenders(
     .bind(guild_id_u64 as i64)
     .fetch_all(state.db.pool())
     .await
-    .map_err(|e| {
-        tracing::error!("Failed to query top offenders: {}", e);
-        error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to query top offenders",
-        )
-    })?;
+    .unwrap_or_default();
 
     // Build top users list with warning levels
     let mut top_users = Vec::new();
+    let mut user_ids_to_fetch = Vec::new();
+
+    for row in &top_users_rows {
+        use sqlx::Row;
+        let user_id: i64 = row.get("user_id");
+        user_ids_to_fetch.push(user_id as u64);
+    }
+
+    // Batch fetch user information
+    let user_info_map = state
+        .user_service
+        .get_users_batch(user_ids_to_fetch)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!("Failed to batch fetch user info for top offenders: {}", e);
+            std::collections::HashMap::new()
+        });
+
     for row in top_users_rows {
         use sqlx::Row;
         let user_id: i64 = row.get("user_id");
@@ -1280,16 +1933,22 @@ async fn get_top_offenders(
             .warning_system
             .get_warning(user_id as u64, guild_id_u64)
             .await
-            .map_err(|_| {
-                error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Failed to get warning level",
-                )
-            })?;
+            .unwrap_or_else(|_| {
+                // Return default warning on error
+                crate::warnings::UserWarning {
+                    user_id: user_id as u64,
+                    guild_id: guild_id_u64,
+                    level: crate::warnings::WarningLevel::None,
+                    kicked_before: false,
+                    last_violation: None,
+                }
+            });
+
+        let user_info = user_info_map.get(&(user_id as u64));
 
         top_users.push(OffenderEntry {
             user_id: user_id.to_string(),
-            username: None, // Username requires Discord API lookup, not stored in DB
+            username: user_info.map(|u| u.username.clone()),
             violation_count: violation_count as u32,
             warning_level: warning.level as u8,
             last_violation,
@@ -1311,13 +1970,7 @@ async fn get_top_offenders(
     .bind(guild_id_u64 as i64)
     .fetch_all(state.db.pool())
     .await
-    .map_err(|e| {
-        tracing::error!("Failed to query violation distribution: {}", e);
-        error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to query violation distribution",
-        )
-    })?;
+    .unwrap_or_default();
 
     let mut violation_distribution = std::collections::HashMap::new();
     for row in distribution_rows {
@@ -1334,13 +1987,7 @@ async fn get_top_offenders(
             .bind(guild_id_u64 as i64)
             .fetch_one(state.db.pool())
             .await
-            .map_err(|e| {
-                tracing::error!("Failed to count moderated users: {}", e);
-                error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Failed to count moderated users",
-                )
-            })?;
+            .unwrap_or(0);
 
     // For percentage calculation, we need total users in the server
     // Since we don't track all server members, we'll use a simplified approach:
@@ -1413,13 +2060,7 @@ async fn get_rule_effectiveness(
         .bind(guild_id_u64 as i64)
         .fetch_all(state.db.pool())
         .await
-        .map_err(|e| {
-            tracing::error!("Failed to query rule effectiveness: {}", e);
-            error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to query rule effectiveness",
-            )
-        })?;
+        .unwrap_or_default();
 
     // Build top rules list with severity distribution
     let mut top_rules = Vec::new();
@@ -1464,37 +2105,34 @@ async fn get_temporal_analytics(
         .parse()
         .map_err(|_| error_response(StatusCode::BAD_REQUEST, "Invalid guild ID"))?;
 
-    // Query all violations with timestamps for heatmap generation
-    let rows =
-        sqlx::query("SELECT timestamp FROM violations WHERE guild_id = ? ORDER BY timestamp ASC")
-            .bind(guild_id_u64 as i64)
-            .fetch_all(state.db.pool())
-            .await
-            .map_err(|e| {
-                tracing::error!("Failed to query violations for temporal analytics: {}", e);
-                error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Failed to query violations",
-                )
-            })?;
+    // Query all violations with timestamps and user_ids for heatmap generation and major events
+    let rows = sqlx::query(
+        "SELECT timestamp, user_id FROM violations WHERE guild_id = ? ORDER BY timestamp ASC",
+    )
+    .bind(guild_id_u64 as i64)
+    .fetch_all(state.db.pool())
+    .await
+    .unwrap_or_default();
 
     // Parse timestamps and build heatmap
     let mut heatmap_data: std::collections::HashMap<(u8, u8), u32> =
         std::collections::HashMap::new();
-    let mut timestamps: Vec<chrono::DateTime<chrono::Utc>> = Vec::new();
+    let mut timestamps_with_users: Vec<(chrono::DateTime<chrono::Utc>, u64)> = Vec::new();
 
     for row in rows {
         use sqlx::Row;
         let timestamp_str: String = row.get("timestamp");
+        let user_id: i64 = row.get("user_id");
 
-        let timestamp = chrono::DateTime::parse_from_rfc3339(&timestamp_str)
-            .map_err(|e| {
+        let timestamp = match chrono::DateTime::parse_from_rfc3339(&timestamp_str) {
+            Ok(ts) => ts.with_timezone(&chrono::Utc),
+            Err(e) => {
                 tracing::error!("Invalid timestamp format: {}", e);
-                error_response(StatusCode::INTERNAL_SERVER_ERROR, "Invalid timestamp")
-            })?
-            .with_timezone(&chrono::Utc);
+                continue;
+            }
+        };
 
-        timestamps.push(timestamp);
+        timestamps_with_users.push((timestamp, user_id as u64));
 
         // Extract day of week (0 = Sunday, 6 = Saturday) and hour (0-23)
         let day_of_week = timestamp.weekday().num_days_from_sunday() as u8;
@@ -1532,27 +2170,60 @@ async fn get_temporal_analytics(
     // Detect major moderation events (10+ violations within 5 minutes)
     let mut major_events: Vec<ModerationEvent> = Vec::new();
 
-    if !timestamps.is_empty() {
+    if !timestamps_with_users.is_empty() {
         let mut i = 0;
-        while i < timestamps.len() {
-            let window_start = timestamps[i];
+        while i < timestamps_with_users.len() {
+            let window_start = timestamps_with_users[i].0;
             let window_end = window_start + chrono::Duration::minutes(5);
 
-            // Count violations in this 5-minute window
+            // Collect violations and user IDs in this 5-minute window
             let mut count = 0;
+            let mut event_user_ids = Vec::new();
             let mut j = i;
-            while j < timestamps.len() && timestamps[j] <= window_end {
+            while j < timestamps_with_users.len() && timestamps_with_users[j].0 <= window_end {
+                event_user_ids.push(timestamps_with_users[j].1);
                 count += 1;
                 j += 1;
             }
 
-            // If 10+ violations, record as major event
+            // If 10+ violations, record as major event with user info
             if count >= 10 {
+                // Get unique user IDs
+                let unique_user_ids: Vec<u64> = {
+                    let mut ids = event_user_ids.clone();
+                    ids.sort_unstable();
+                    ids.dedup();
+                    ids
+                };
+
+                // Batch fetch user information for this event
+                let user_info_map = state
+                    .user_service
+                    .get_users_batch(unique_user_ids.clone())
+                    .await
+                    .unwrap_or_else(|e| {
+                        tracing::warn!("Failed to batch fetch user info for major event: {}", e);
+                        std::collections::HashMap::new()
+                    });
+
+                let user_ids_str: Vec<String> =
+                    unique_user_ids.iter().map(|id| id.to_string()).collect();
+                let usernames: Vec<String> = unique_user_ids
+                    .iter()
+                    .filter_map(|id| user_info_map.get(id).map(|u| u.username.clone()))
+                    .collect();
+
                 major_events.push(ModerationEvent {
                     timestamp: window_start.to_rfc3339(),
                     event_type: "mass_violations".to_string(),
                     description: format!("{} violations in 5 minutes", count),
                     violation_count: count,
+                    user_ids: Some(user_ids_str),
+                    usernames: if usernames.is_empty() {
+                        None
+                    } else {
+                        Some(usernames)
+                    },
                 });
 
                 // Skip ahead to avoid overlapping events
@@ -1564,11 +2235,11 @@ async fn get_temporal_analytics(
     }
 
     // Calculate average violations per hour
-    let avg_violations_per_hour = if !timestamps.is_empty() {
-        let earliest = timestamps.first().unwrap();
-        let latest = timestamps.last().unwrap();
+    let avg_violations_per_hour = if !timestamps_with_users.is_empty() {
+        let earliest = &timestamps_with_users.first().unwrap().0;
+        let latest = &timestamps_with_users.last().unwrap().0;
         let duration_hours = (*latest - *earliest).num_hours().max(1) as f64;
-        timestamps.len() as f64 / duration_hours
+        timestamps_with_users.len() as f64 / duration_hours
     } else {
         0.0
     };
@@ -1652,6 +2323,33 @@ async fn verify_guild_admin(
     Ok(session)
 }
 
+async fn get_deduplication_stats(State(state): State<AppState>) -> Json<DeduplicationStats> {
+    Json(state.deduplicator.stats())
+}
+
+/// WebSocket endpoint handler
+async fn websocket_handler(
+    ws: axum::extract::WebSocketUpgrade,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    // Authenticate the WebSocket connection using session cookie
+    let session = get_session(&state, &headers).await?;
+
+    tracing::info!(
+        "WebSocket connection authenticated for user: {}",
+        session.username
+    );
+
+    // Upgrade the connection to WebSocket
+    Ok(ws.on_upgrade(move |socket| async move {
+        let manager = state.websocket_manager.clone();
+        if let Err(e) = manager.handle_connection(socket, session).await {
+            tracing::error!("WebSocket connection error: {}", e);
+        }
+    }))
+}
+
 /// Calculate server health score from violation rate, response time, and escalation rate.
 /// Returns a score between 0 and 100.
 fn calculate_health_score(
@@ -1700,11 +2398,17 @@ mod tests {
 
     #[test]
     fn error_response_serializes() {
-        let err = ErrorResponse {
-            error: "test error".to_string(),
-        };
+        let err = ErrorResponse::new("test error");
         let json = serde_json::to_string(&err).unwrap();
         assert!(json.contains("test error"));
+    }
+
+    #[test]
+    fn error_response_with_request_id() {
+        let err = ErrorResponse::with_request_id("test error", "req-123");
+        let json = serde_json::to_string(&err).unwrap();
+        assert!(json.contains("test error"));
+        assert!(json.contains("req-123"));
     }
 
     #[test]
@@ -2319,6 +3023,62 @@ mod tests {
             "Average should be at least 10 violations per hour, got {}",
             avg_violations_per_hour
         );
+    }
+
+    #[test]
+    fn request_deduplicator_stats() {
+        let deduplicator = super::RequestDeduplicator::new();
+
+        // Initial stats should be zero
+        let stats = deduplicator.stats();
+        assert_eq!(stats.total_requests, 0);
+        assert_eq!(stats.deduplicated_requests, 0);
+        assert_eq!(stats.hit_rate, 0.0);
+        assert_eq!(stats.in_flight_count, 0);
+    }
+
+    #[test]
+    fn request_key_generation() {
+        use axum::http::{Method, Uri};
+
+        // Same method and path should generate same key
+        let uri1: Uri = "/api/test?foo=bar".parse().unwrap();
+        let uri2: Uri = "/api/test?foo=bar".parse().unwrap();
+        let key1 = super::RequestDeduplicator::request_key(&Method::GET, &uri1);
+        let key2 = super::RequestDeduplicator::request_key(&Method::GET, &uri2);
+        assert_eq!(key1, key2);
+
+        // Different paths should generate different keys
+        let uri3: Uri = "/api/other?foo=bar".parse().unwrap();
+        let key3 = super::RequestDeduplicator::request_key(&Method::GET, &uri3);
+        assert_ne!(key1, key3);
+
+        // Different methods should generate different keys
+        let key4 = super::RequestDeduplicator::request_key(&Method::POST, &uri1);
+        assert_ne!(key1, key4);
+
+        // Different query params should generate different keys
+        let uri5: Uri = "/api/test?foo=baz".parse().unwrap();
+        let key5 = super::RequestDeduplicator::request_key(&Method::GET, &uri5);
+        assert_ne!(key1, key5);
+    }
+
+    #[tokio::test]
+    async fn deduplication_stats_tracking() {
+        let deduplicator = super::RequestDeduplicator::new();
+
+        // Simulate some requests
+        deduplicator
+            .total_requests
+            .fetch_add(10, std::sync::atomic::Ordering::Relaxed);
+        deduplicator
+            .deduplicated_count
+            .fetch_add(3, std::sync::atomic::Ordering::Relaxed);
+
+        let stats = deduplicator.stats();
+        assert_eq!(stats.total_requests, 10);
+        assert_eq!(stats.deduplicated_requests, 3);
+        assert_eq!(stats.hit_rate, 30.0);
     }
 }
 
@@ -3207,4 +3967,131 @@ mod property_tests {
             }).expect("property test should pass")
         }
     }
+}
+
+// ========== Notification Endpoints ==========
+
+/// Get notifications for a guild
+async fn get_notifications(
+    State(state): State<AppState>,
+    Path(guild_id): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let guild_id: u64 = guild_id.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
+    let limit: u32 = params
+        .get("limit")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(50);
+
+    let notification_service = crate::notification::NotificationService::new(state.db.clone());
+
+    let notifications = notification_service
+        .get_notifications(guild_id, None, limit)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to get notifications: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    Ok(Json(serde_json::json!({
+        "notifications": notifications
+    })))
+}
+
+/// Mark notification as read
+async fn mark_notification_read(
+    State(state): State<AppState>,
+    Path((guild_id, notification_id)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let _guild_id: u64 = guild_id.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
+    let notification_id: i64 = notification_id
+        .parse()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    let notification_service = crate::notification::NotificationService::new(state.db.clone());
+
+    notification_service
+        .mark_as_read(notification_id)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to mark notification as read: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    Ok(Json(serde_json::json!({
+        "success": true
+    })))
+}
+
+/// Mark notification as unread
+async fn mark_notification_unread(
+    State(state): State<AppState>,
+    Path((guild_id, notification_id)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let _guild_id: u64 = guild_id.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
+    let notification_id: i64 = notification_id
+        .parse()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    let notification_service = crate::notification::NotificationService::new(state.db.clone());
+
+    notification_service
+        .mark_as_unread(notification_id)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to mark notification as unread: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    Ok(Json(serde_json::json!({
+        "success": true
+    })))
+}
+
+/// Get notification preferences for a guild
+async fn get_notification_preferences(
+    State(state): State<AppState>,
+    Path(guild_id): Path<String>,
+) -> Result<Json<crate::notification::NotificationPreferences>, StatusCode> {
+    let guild_id: u64 = guild_id.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    let notification_service = crate::notification::NotificationService::new(state.db.clone());
+
+    let preferences = notification_service
+        .get_preferences(guild_id)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to get notification preferences: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    Ok(Json(preferences))
+}
+
+/// Update notification preferences for a guild
+async fn update_notification_preferences(
+    State(state): State<AppState>,
+    Path(guild_id): Path<String>,
+    Json(preferences): Json<crate::notification::NotificationPreferences>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let guild_id: u64 = guild_id.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    // Ensure guild_id matches
+    if preferences.guild_id != guild_id {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let notification_service = crate::notification::NotificationService::new(state.db.clone());
+
+    notification_service
+        .update_preferences(&preferences)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to update notification preferences: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    Ok(Json(serde_json::json!({
+        "success": true
+    })))
 }

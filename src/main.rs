@@ -19,7 +19,7 @@ use murdoch::commands::SlashCommandHandler;
 use murdoch::config::MurdochConfig;
 use murdoch::database::Database;
 use murdoch::discord::DiscordClient;
-use murdoch::error::Result;
+use murdoch::error::{MurdochError, Result};
 use murdoch::filter::{PatternSet, RegexFilter};
 use murdoch::health::spawn_health_server;
 use murdoch::metrics::MetricsCollector;
@@ -86,8 +86,9 @@ impl EventHandler for MurdochHandler {
                     use chrono::Utc;
                     use serenity::model::Timestamp;
                     let timeout_until = Timestamp::from_unix_timestamp(
-                        Utc::now().timestamp() + 600 // 10 minutes
-                    ).unwrap_or_else(|_| Timestamp::now());
+                        Utc::now().timestamp() + 600, // 10 minutes
+                    )
+                    .unwrap_or_else(|_| Timestamp::now());
                     if let Err(e) = member
                         .disable_communication_until_datetime(&ctx.http, timeout_until)
                         .await
@@ -181,7 +182,9 @@ fn spawn_background_tasks(
     raid_detector: Arc<RaidDetector>,
     warning_system: Arc<WarningSystem>,
     session_manager: Arc<SessionManager>,
-    _metrics: Arc<MetricsCollector>,
+    metrics: Arc<MetricsCollector>,
+    websocket_manager: Arc<murdoch::websocket::WebSocketManager>,
+    db: Arc<Database>,
 ) {
     // Buffer flush task
     spawn_flush_task(pipeline);
@@ -247,6 +250,84 @@ fn spawn_background_tasks(
             tracing::debug!("Metrics flush interval tick");
         }
     });
+
+    // Metrics broadcast task (runs every 30 seconds)
+    let metrics_clone = metrics.clone();
+    let ws_manager = websocket_manager.clone();
+    let db_clone = db.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        loop {
+            interval.tick().await;
+
+            // Get all active guilds from the database
+            let guild_ids = match get_active_guilds(&db_clone).await {
+                Ok(ids) => ids,
+                Err(e) => {
+                    tracing::error!(error = %e, "Failed to get active guilds for metrics broadcast");
+                    continue;
+                }
+            };
+
+            // Broadcast metrics update for each guild
+            for guild_id in guild_ids {
+                let counters = metrics_clone.get_counters(guild_id).await;
+
+                // Calculate health score (simplified version)
+                let violation_rate = if counters.messages_processed > 0 {
+                    (counters.total_violations() as f64 / counters.messages_processed as f64)
+                        * 1000.0
+                } else {
+                    0.0
+                };
+
+                let health_score = if counters.total_violations() == 0 {
+                    100
+                } else {
+                    // Simple health score calculation
+                    let score = 100.0 - (violation_rate * 2.0).min(100.0);
+                    score.max(0.0) as u8
+                };
+
+                let event =
+                    murdoch::websocket::WsEvent::MetricsUpdate(murdoch::websocket::MetricsUpdate {
+                        guild_id: guild_id.to_string(),
+                        messages_processed: counters.messages_processed,
+                        violations_total: counters.total_violations(),
+                        health_score,
+                    });
+
+                if let Err(e) = ws_manager.broadcast_to_guild(&guild_id.to_string(), event) {
+                    tracing::debug!(
+                        guild_id = guild_id,
+                        error = %e,
+                        "Failed to broadcast metrics update (no subscribers)"
+                    );
+                }
+            }
+        }
+    });
+}
+
+/// Get list of active guilds from the database.
+async fn get_active_guilds(db: &Database) -> Result<Vec<u64>> {
+    // Query distinct guild IDs from violations table (guilds with recent activity)
+    let rows = sqlx::query(
+        "SELECT DISTINCT guild_id FROM violations WHERE timestamp >= datetime('now', '-1 day')",
+    )
+    .fetch_all(db.pool())
+    .await
+    .map_err(|e| MurdochError::Database(format!("Failed to get active guilds: {}", e)))?;
+
+    let guild_ids: Vec<u64> = rows
+        .into_iter()
+        .map(|row| {
+            use sqlx::Row;
+            row.get::<i64, _>("guild_id") as u64
+        })
+        .collect();
+
+    Ok(guild_ids)
 }
 
 /// Build OAuth handler if credentials are configured.
@@ -274,7 +355,12 @@ async fn main() -> Result<()> {
     // Load .env file if present
     let _ = dotenvy::dotenv();
 
-    // Initialize tracing
+    // Initialize tracing with configurable log levels
+    // Supports RUST_LOG environment variable with levels: trace, debug, info, warn, error
+    // Examples:
+    //   RUST_LOG=debug        - Enable debug logging for all modules
+    //   RUST_LOG=murdoch=debug - Enable debug logging for murdoch only
+    //   RUST_LOG=info         - Default: info level logging
     tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer())
         .with(
@@ -285,13 +371,6 @@ async fn main() -> Result<()> {
 
     tracing::info!("Murdoch bot starting...");
 
-    // Start health check server
-    let health_port = std::env::var("HEALTH_PORT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(8080);
-    spawn_health_server(health_port);
-
     // Load configuration
     let config = MurdochConfig::from_env()?;
     tracing::info!("Configuration loaded");
@@ -300,6 +379,22 @@ async fn main() -> Result<()> {
     let db_path = std::env::var("DATABASE_PATH").unwrap_or_else(|_| "murdoch.db".to_string());
     let db = Arc::new(Database::new(&db_path).await?);
     tracing::info!(path = %db_path, "Database initialized");
+
+    // Build cache service early (needed for health checks)
+    let cache_service = Arc::new(murdoch::cache::CacheService::new());
+    tracing::info!("Cache service initialized");
+
+    // Start health check server with enhanced checks
+    let health_port = std::env::var("HEALTH_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8080);
+    let health_state = murdoch::health::HealthState {
+        db: db.clone(),
+        cache: cache_service.clone(),
+        discord_token: Some(config.discord_token.clone()),
+    };
+    spawn_health_server(health_port, health_state);
 
     // Build core components
     let patterns = PatternSet::new(
@@ -346,6 +441,9 @@ async fn main() -> Result<()> {
     tracing::info!("Metrics collector initialized");
 
     // Build pipeline with rules engine and warning system
+    let websocket_manager = Arc::new(murdoch::websocket::WebSocketManager::new());
+    tracing::info!("WebSocket manager initialized");
+
     let pipeline = ModDirectorPipeline::new(
         regex_filter,
         message_buffer,
@@ -353,7 +451,8 @@ async fn main() -> Result<()> {
         discord_client,
     )
     .with_rules_engine(RulesEngine::new(db.clone()))
-    .with_warning_system(warning_system.clone());
+    .with_warning_system(warning_system.clone())
+    .with_websocket_manager(websocket_manager.clone());
     let pipeline = Arc::new(pipeline);
 
     // Build slash command handler
@@ -367,6 +466,22 @@ async fn main() -> Result<()> {
     let session_manager = Arc::new(SessionManager::new(db.clone()));
     tracing::info!("Session manager initialized");
 
+    // Build user service
+    let user_service = Arc::new(murdoch::user_service::UserService::new(
+        cache_service.clone(),
+        db.clone(),
+        http.clone(),
+    ));
+    tracing::info!("User service initialized");
+
+    // Build notification service with WebSocket support
+    let notification_service =
+        Arc::new(murdoch::notification::NotificationService::with_websocket(
+            db.clone(),
+            websocket_manager.clone(),
+        ));
+    tracing::info!("Notification service initialized");
+
     // Build OAuth handler (optional, only if credentials are configured)
     let oauth_handler = build_oauth_handler();
 
@@ -377,6 +492,8 @@ async fn main() -> Result<()> {
         warning_system.clone(),
         session_manager.clone(),
         metrics.clone(),
+        websocket_manager.clone(),
+        db.clone(),
     );
     tracing::info!("Background tasks spawned");
 
@@ -396,6 +513,11 @@ async fn main() -> Result<()> {
             metrics: metrics.clone(),
             rules_engine: rules_engine.clone(),
             warning_system: warning_system.clone(),
+            user_service: user_service.clone(),
+            deduplicator: Arc::new(web::RequestDeduplicator::new()),
+            websocket_manager: websocket_manager.clone(),
+            export_service: Arc::new(murdoch::export::ExportService::new(db.clone())),
+            notification_service: notification_service.clone(),
             dashboard_url,
             client_id,
         };

@@ -41,6 +41,8 @@ pub struct ModDirectorPipeline {
     rules_engine: Option<Arc<RulesEngine>>,
     /// Warning system for escalation.
     warning_system: Option<Arc<WarningSystem>>,
+    /// WebSocket manager for real-time updates.
+    websocket_manager: Option<Arc<crate::websocket::WebSocketManager>>,
 }
 
 impl ModDirectorPipeline {
@@ -60,6 +62,7 @@ impl ModDirectorPipeline {
             context_tracker: Arc::new(ContextTracker::new()),
             rules_engine: None,
             warning_system: None,
+            websocket_manager: None,
         }
     }
 
@@ -72,6 +75,15 @@ impl ModDirectorPipeline {
     /// Add warning system to the pipeline.
     pub fn with_warning_system(mut self, warning_system: Arc<WarningSystem>) -> Self {
         self.warning_system = Some(warning_system);
+        self
+    }
+
+    /// Add WebSocket manager to the pipeline.
+    pub fn with_websocket_manager(
+        mut self,
+        websocket_manager: Arc<crate::websocket::WebSocketManager>,
+    ) -> Self {
+        self.websocket_manager = Some(websocket_manager);
         self
     }
 
@@ -132,6 +144,21 @@ impl ModDirectorPipeline {
                         "regex",
                     )
                     .await?;
+
+                    // Broadcast violation event to WebSocket clients
+                    let action_taken = "message_deleted"; // Regex violations always delete
+                    self.broadcast_violation_event(
+                        guild_id.get(),
+                        message.author.id.get(),
+                        match severity {
+                            SeverityLevel::High => "high",
+                            SeverityLevel::Medium => "medium",
+                            SeverityLevel::Low => "low",
+                        },
+                        &format!("{} ({:?})", reason, pattern_type),
+                        action_taken,
+                    )
+                    .await;
                 }
 
                 self.discord_client.process_queue().await?;
@@ -223,6 +250,81 @@ impl ModDirectorPipeline {
         Ok(())
     }
 
+    /// Handle warning escalation silently (record violation, return level, don't queue action).
+    /// This is used when we want to accumulate violations and send a summarized notification.
+    async fn handle_warning_escalation_silent(
+        &self,
+        guild_id: serenity::model::id::GuildId,
+        user_id: serenity::model::id::UserId,
+        message_id: serenity::model::id::MessageId,
+        reason: &str,
+        severity: &SeverityLevel,
+        detection_type: &str,
+    ) -> Result<crate::warnings::WarningLevel> {
+        let Some(warning_system) = &self.warning_system else {
+            return Ok(crate::warnings::WarningLevel::Warning);
+        };
+
+        let severity_str = match severity {
+            SeverityLevel::High => "high",
+            SeverityLevel::Medium => "medium",
+            SeverityLevel::Low => "low",
+        };
+
+        let warning_level = warning_system
+            .record_violation(
+                user_id.get(),
+                guild_id.get(),
+                message_id.get(),
+                reason,
+                severity_str,
+                detection_type,
+            )
+            .await?;
+
+        // If user was kicked, mark them as kicked for future escalation
+        if warning_level == crate::warnings::WarningLevel::Kick {
+            warning_system
+                .mark_kicked(user_id.get(), guild_id.get())
+                .await?;
+        }
+
+        tracing::debug!(
+            user_id = %user_id,
+            guild_id = %guild_id,
+            warning_level = ?warning_level,
+            "Warning recorded (silent)"
+        );
+
+        Ok(warning_level)
+    }
+
+    /// Broadcast violation event to WebSocket clients.
+    async fn broadcast_violation_event(
+        &self,
+        guild_id: u64,
+        user_id: u64,
+        severity: &str,
+        reason: &str,
+        action_taken: &str,
+    ) {
+        if let Some(ws_manager) = &self.websocket_manager {
+            let event = crate::websocket::WsEvent::Violation(crate::websocket::ViolationEvent {
+                guild_id: guild_id.to_string(),
+                user_id: user_id.to_string(),
+                username: None, // Will be enriched by frontend if needed
+                severity: severity.to_string(),
+                reason: reason.to_string(),
+                action_taken: action_taken.to_string(),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+            });
+
+            if let Err(e) = ws_manager.broadcast_to_guild(&guild_id.to_string(), event) {
+                tracing::error!("Failed to broadcast violation event: {}", e);
+            }
+        }
+    }
+
     /// Flush the message buffer and process with Gemini.
     pub async fn flush_buffer(&self) -> Result<()> {
         let Some(analyzer) = &self.gemini_analyzer else {
@@ -240,10 +342,29 @@ impl ModDirectorPipeline {
         let channel_id = messages.first().map(|m| m.channel_id.get()).unwrap_or(0);
 
         // Get server rules if available
-        let server_rules = if let Some(_rules_engine) = &self.rules_engine {
-            // Extract guild_id from message if available (would need to be passed in)
-            // For now, we'll skip rules in the basic flush
-            None
+        let server_rules = if let Some(rules_engine) = &self.rules_engine {
+            // Extract guild_id from first message
+            if let Some(guild_id) = messages.first().and_then(|m| m.guild_id) {
+                match rules_engine.get_rules(guild_id.get()).await {
+                    Ok(Some(rules)) => {
+                        tracing::debug!(
+                            guild_id = guild_id.get(),
+                            "Using server-specific rules for analysis"
+                        );
+                        Some(rules.rules_text)
+                    }
+                    Ok(None) => {
+                        tracing::debug!(guild_id = guild_id.get(), "No server rules configured");
+                        None
+                    }
+                    Err(e) => {
+                        tracing::warn!(guild_id = guild_id.get(), error = %e, "Failed to fetch server rules");
+                        None
+                    }
+                }
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -281,6 +402,16 @@ impl ModDirectorPipeline {
                     );
                 }
 
+                // Group violations by user for summarized notifications
+                use std::collections::HashMap;
+                let mut user_violations: HashMap<u64, Vec<crate::models::ViolationReport>> =
+                    HashMap::new();
+                let mut user_warning_levels: HashMap<u64, crate::warnings::WarningLevel> =
+                    HashMap::new();
+                let mut user_channel_ids: HashMap<u64, serenity::model::id::ChannelId> =
+                    HashMap::new();
+                let mut user_guild_ids: HashMap<u64, serenity::model::id::GuildId> = HashMap::new();
+
                 for violation in response.violations {
                     // Find the original message
                     let Some(original) = messages
@@ -308,19 +439,53 @@ impl ModDirectorPipeline {
                         .timestamp(Utc::now())
                         .build()?;
 
-                    self.discord_client.handle_violation(report).await?;
-
-                    // Record violation and execute warning action
-                    if let Some(guild_id) = original.guild_id {
-                        self.handle_warning_escalation(
-                            guild_id,
-                            original.author_id,
-                            original.message_id,
-                            &violation.reason,
-                            &severity,
-                            "ai",
-                        )
+                    // Queue message deletion (but not individual notification)
+                    self.discord_client
+                        .queue_delete_message(original.channel_id, original.message_id)
                         .await?;
+
+                    let user_id = original.author_id.get();
+                    user_violations.entry(user_id).or_default().push(report);
+                    user_channel_ids.insert(user_id, original.channel_id);
+                    if let Some(guild_id) = original.guild_id {
+                        user_guild_ids.insert(user_id, guild_id);
+                    }
+
+                    // Record violation and get warning level
+                    if let Some(guild_id) = original.guild_id {
+                        let warning_level = self
+                            .handle_warning_escalation_silent(
+                                guild_id,
+                                original.author_id,
+                                original.message_id,
+                                &violation.reason,
+                                &severity,
+                                "ai",
+                            )
+                            .await?;
+
+                        // Keep highest warning level for this user
+                        let current_level = user_warning_levels
+                            .get(&user_id)
+                            .cloned()
+                            .unwrap_or(crate::warnings::WarningLevel::None);
+                        if warning_level > current_level {
+                            user_warning_levels.insert(user_id, warning_level);
+                        }
+
+                        // Broadcast violation event to WebSocket clients
+                        self.broadcast_violation_event(
+                            guild_id.get(),
+                            user_id,
+                            match severity {
+                                SeverityLevel::High => "high",
+                                SeverityLevel::Medium => "medium",
+                                SeverityLevel::Low => "low",
+                            },
+                            &violation.reason,
+                            "message_deleted",
+                        )
+                        .await;
                     }
 
                     tracing::info!(
@@ -329,6 +494,53 @@ impl ModDirectorPipeline {
                         severity = ?severity,
                         "Gemini analyzer violation detected"
                     );
+                }
+
+                // Send summarized notification per user
+                for (user_id, violations) in user_violations {
+                    if violations.is_empty() {
+                        continue;
+                    }
+
+                    let Some(channel_id) = user_channel_ids.get(&user_id).cloned() else {
+                        tracing::warn!(
+                            user_id = user_id,
+                            "No channel ID for user, skipping notification"
+                        );
+                        continue;
+                    };
+                    let warning_level = user_warning_levels
+                        .get(&user_id)
+                        .cloned()
+                        .unwrap_or(crate::warnings::WarningLevel::Warning);
+
+                    // Queue the warning action (timeout/kick/ban)
+                    if let Some(guild_id) = user_guild_ids.get(&user_id) {
+                        let first_reason = violations
+                            .first()
+                            .map(|v| v.reason.as_str())
+                            .unwrap_or("Multiple violations");
+                        self.discord_client
+                            .queue_warning_action(
+                                *guild_id,
+                                serenity::model::id::UserId::new(user_id),
+                                warning_level.clone(),
+                                first_reason,
+                            )
+                            .await?;
+                    }
+
+                    // Queue summarized notification
+                    self.discord_client
+                        .queue_summary_notification(
+                            channel_id,
+                            serenity::model::id::UserId::new(user_id),
+                            violations,
+                            warning_level,
+                        )
+                        .await?;
+
+                    tracing::info!(user_id = user_id, "Sent summarized violation notification");
                 }
 
                 self.discord_client.process_queue().await?;

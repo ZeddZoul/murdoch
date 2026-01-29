@@ -1,0 +1,112 @@
+    Checking murdoch v0.1.0 (/Users/zedd/Work/Murdoch)
+warning: this function has too many arguments (8/7)
+   --> src/export.rs:465:5
+    |
+465 | /     async fn record_export(
+466 | |         &self,
+467 | |         guild_id: GuildId,
+468 | |         export_type: ExportType,
+...   |
+473 | |         user_id: UserId,
+474 | |     ) -> Result<i64> {
+    | |____________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#too_many_arguments
+    = note: `#[warn(clippy::too_many_arguments)]` on by default
+
+warning: method `from_str` can be confused for the standard trait method `std::str::FromStr::from_str`
+  --> src/notification.rs:45:5
+   |
+45 | /     pub fn from_str(s: &str) -> Option<Self> {
+46 | |         match s {
+47 | |             "low" => Some(Self::Low),
+48 | |             "medium" => Some(Self::Medium),
+...  |
+53 | |     }
+   | |_____^
+   |
+   = help: consider implementing the trait `std::str::FromStr` or choosing a less ambiguous method name
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#should_implement_trait
+   = note: `#[warn(clippy::should_implement_trait)]` on by default
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+   --> src/raid.rs:115:20
+    |
+115 |     user_messages: Arc<RwLock<HashMap<u64, HashMap<u64, VecDeque<Instant>>>>>,
+    |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#type_complexity
+    = note: `#[warn(clippy::type_complexity)]` on by default
+
+warning: method `from_str` can be confused for the standard trait method `std::str::FromStr::from_str`
+  --> src/rbac.rs:87:5
+   |
+87 | /     pub fn from_str(s: &str) -> Option<Self> {
+88 | |         match s.to_lowercase().as_str() {
+89 | |             "owner" => Some(RoleType::Owner),
+90 | |             "admin" => Some(RoleType::Admin),
+...  |
+95 | |     }
+   | |_____^
+   |
+   = help: consider implementing the trait `std::str::FromStr` or choosing a less ambiguous method name
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#should_implement_trait
+
+warning: manual implementation of `split_once`
+   --> src/rbac.rs:577:13
+    |
+577 |             let mut parts = cookie.trim().splitn(2, '=');
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+578 |             let name = parts.next()?;
+    |             ------------------------- first usage here
+579 |             let value = parts.next()?;
+    |             -------------------------- second usage here
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#manual_split_once
+    = note: `#[warn(clippy::manual_split_once)]` on by default
+help: replace with `split_once`
+    |
+577 ~             let (name, value) = cookie.trim().split_once('=')?;
+578 ~             
+579 ~             
+    |
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+  --> src/web.rs:56:16
+   |
+56 |     in_flight: Arc<DashMap<String, tokio::sync::broadcast::Sender<Result<Vec<u8>, String>>>>,
+   |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#type_complexity
+
+warning: unnecessary closure used to substitute value for `Result::Err`
+    --> src/web.rs:1700:23
+     |
+1700 |           let warning = state
+     |  _______________________^
+1701 | |             .warning_system
+1702 | |             .get_warning(user_id as u64, guild_id_u64)
+1703 | |             .await
+...    |
+1713 | |             });
+     | |______________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#unnecessary_lazy_evaluations
+     = note: `#[warn(clippy::unnecessary_lazy_evaluations)]` on by default
+help: use `unwrap_or` instead
+     |
+1704 ~             .unwrap_or({
+1705 +                 // Return default warning on error
+1706 +                 crate::warnings::UserWarning {
+1707 +                     user_id: user_id as u64,
+1708 +                     guild_id: guild_id_u64,
+1709 +                     level: crate::warnings::WarningLevel::None,
+1710 +                     kicked_before: false,
+1711 +                     last_violation: None,
+1712 +                 }
+1713 ~             });
+     |
+
+warning: `murdoch` (lib) generated 7 warnings (run `cargo clippy --fix --lib -p murdoch` to apply 2 suggestions)
+warning: `murdoch` (lib test) generated 7 warnings (7 duplicates)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.79s

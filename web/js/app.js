@@ -6,11 +6,447 @@
 import { auth } from './auth.js';
 import { api } from './api.js';
 import { router } from './router.js';
+import { themeManager } from './theme.js';
+import { notificationCenter } from './notifications.js';
+import { renderSinglePageDashboard } from './single-page-dashboard.js?v=7';
 
 // Global state
 let currentServer = null;
 let autoRefreshInterval = null;
 let clientId = null;
+let toastContainer = null;
+let lastDataUpdate = null;
+let pollingEnabled = false;
+let pollingRetryCount = 0;
+let pollingRetryDelay = 30000; // Start at 30 seconds
+const MAX_POLLING_RETRY_DELAY = 300000; // Max 5 minutes
+
+/**
+ * Detect if the device is mobile
+ * @returns {boolean} True if mobile device
+ */
+function isMobileDevice() {
+  return window.innerWidth < 768;
+}
+
+/**
+ * Initialize pull-to-refresh functionality for mobile devices
+ */
+function initPullToRefresh() {
+  if (!isMobileDevice()) {
+    return;
+  }
+
+  let startY = 0;
+  let currentY = 0;
+  let pulling = false;
+  let refreshing = false;
+  const threshold = 80; // Pull distance threshold in pixels
+
+  // Create pull-to-refresh indicator
+  const indicator = document.createElement('div');
+  indicator.id = 'pull-to-refresh-indicator';
+  indicator.className = 'fixed top-16 left-0 right-0 flex justify-center items-center transition-transform duration-300 z-40';
+  indicator.style.transform = 'translateY(-100%)';
+  indicator.innerHTML = `
+    <div class="bg-gray-800 rounded-full p-3 shadow-lg">
+      <svg class="w-6 h-6 text-indigo-400 animate-spin" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+      </svg>
+    </div>
+  `;
+  document.body.appendChild(indicator);
+
+  const handleTouchStart = (e) => {
+    // Only activate if at the top of the page
+    if (window.scrollY === 0 && !refreshing) {
+      startY = e.touches[0].clientY;
+      pulling = true;
+    }
+  };
+
+  const handleTouchMove = (e) => {
+    if (!pulling || refreshing) return;
+
+    currentY = e.touches[0].clientY;
+    const pullDistance = currentY - startY;
+
+    if (pullDistance > 0) {
+      // Prevent default scrolling when pulling down
+      e.preventDefault();
+
+      // Update indicator position
+      const progress = Math.min(pullDistance / threshold, 1);
+      indicator.style.transform = `translateY(${progress * 100 - 100}%)`;
+
+      // Add visual feedback when threshold is reached
+      if (pullDistance >= threshold) {
+        indicator.querySelector('svg').classList.add('text-green-400');
+      } else {
+        indicator.querySelector('svg').classList.remove('text-green-400');
+      }
+    }
+  };
+
+  const handleTouchEnd = async () => {
+    if (!pulling || refreshing) return;
+
+    const pullDistance = currentY - startY;
+
+    if (pullDistance >= threshold) {
+      // Trigger refresh
+      refreshing = true;
+      indicator.style.transform = 'translateY(0)';
+
+      try {
+        // Refresh the current page data
+        const serverId = sessionStorage.getItem('selectedServerId');
+        const currentPath = window.location.hash.substring(1);
+
+        if (serverId && currentPath === '/dashboard') {
+          const period = document.getElementById('period-selector')?.value || 'day';
+          await loadDashboardData(serverId, period);
+        } else if (serverId && currentPath === '/violations') {
+          await loadViolations(serverId, 1);
+        }
+
+        // Show success feedback
+        showToast('Refreshed', 'Data has been updated', 'success');
+      } catch (error) {
+        console.error('Pull-to-refresh failed:', error);
+        showToast('Refresh Failed', 'Could not update data', 'error');
+      } finally {
+        // Hide indicator after a short delay
+        setTimeout(() => {
+          indicator.style.transform = 'translateY(-100%)';
+          refreshing = false;
+        }, 500);
+      }
+    } else {
+      // Reset indicator
+      indicator.style.transform = 'translateY(-100%)';
+    }
+
+    pulling = false;
+    startY = 0;
+    currentY = 0;
+  };
+
+  // Add event listeners
+  document.addEventListener('touchstart', handleTouchStart, { passive: false });
+  document.addEventListener('touchmove', handleTouchMove, { passive: false });
+  document.addEventListener('touchend', handleTouchEnd);
+
+  // Clean up function
+  return () => {
+    document.removeEventListener('touchstart', handleTouchStart);
+    document.removeEventListener('touchmove', handleTouchMove);
+    document.removeEventListener('touchend', handleTouchEnd);
+    indicator.remove();
+  };
+}
+
+/**
+ * Get optimized chart options for mobile devices
+ * @param {object} baseOptions - Base chart options
+ * @returns {object} Optimized options
+ */
+function getOptimizedChartOptions(baseOptions) {
+  if (!isMobileDevice()) {
+    return baseOptions;
+  }
+
+  // Mobile optimizations
+  return {
+    ...baseOptions,
+    plugins: {
+      ...baseOptions.plugins,
+      legend: {
+        ...baseOptions.plugins?.legend,
+        display: baseOptions.plugins?.legend?.display !== false,
+        position: 'bottom',
+        labels: {
+          ...baseOptions.plugins?.legend?.labels,
+          boxWidth: 12,
+          padding: 8,
+          font: {
+            size: 10
+          }
+        }
+      },
+      tooltip: {
+        ...baseOptions.plugins?.tooltip,
+        enabled: true,
+        mode: 'nearest',
+        intersect: true,
+        titleFont: {
+          size: 11
+        },
+        bodyFont: {
+          size: 10
+        },
+        padding: 8
+      }
+    },
+    scales: baseOptions.scales ? {
+      x: {
+        ...baseOptions.scales.x,
+        ticks: {
+          ...baseOptions.scales.x?.ticks,
+          maxRotation: 45,
+          minRotation: 45,
+          font: {
+            size: 9
+          },
+          maxTicksLimit: 6
+        }
+      },
+      y: {
+        ...baseOptions.scales.y,
+        ticks: {
+          ...baseOptions.scales.y?.ticks,
+          font: {
+            size: 9
+          },
+          maxTicksLimit: 5
+        }
+      }
+    } : undefined,
+    elements: {
+      point: {
+        radius: 2,
+        hitRadius: 10,
+        hoverRadius: 4
+      },
+      line: {
+        borderWidth: 2
+      }
+    }
+  };
+}
+
+/**
+ * Show a toast notification
+ * @param {string} title - Toast title
+ * @param {string} message - Toast message
+ * @param {string} type - Toast type: 'info', 'success', 'warning', 'error'
+ * @param {string} link - Optional link to navigate to when clicked
+ */
+function showToast(title, message, type = 'info', link = null) {
+  // Create toast container if it doesn't exist
+  if (!toastContainer) {
+    toastContainer = document.createElement('div');
+    toastContainer.id = 'toast-container';
+    toastContainer.className = 'fixed top-20 right-4 z-50 space-y-2';
+    document.body.appendChild(toastContainer);
+  }
+
+  // Create toast element
+  const toast = document.createElement('div');
+  toast.className = `card max-w-sm animate-slide-in-right ${link ? 'cursor-pointer hover:shadow-lg transition-shadow' : ''}`;
+
+  const colors = {
+    info: 'bg-blue-500',
+    success: 'bg-green-500',
+    warning: 'bg-yellow-500',
+    error: 'bg-red-500'
+  };
+
+  const icons = {
+    info: '<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />',
+    success: '<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />',
+    warning: '<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />',
+    error: '<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2m7-2a9 9 0 11-18 0 9 9 0 0118 0z" />'
+  };
+
+  toast.innerHTML = `
+    <div class="flex items-start gap-3">
+      <div class="${colors[type]} p-2 rounded-lg">
+        <svg class="w-5 h-5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          ${icons[type]}
+        </svg>
+      </div>
+      <div class="flex-1 min-w-0">
+        <p class="font-semibold text-gray-100">${title}</p>
+        <p class="text-sm text-gray-400 mt-1">${message}</p>
+        ${link ? '<p class="text-xs text-blue-400 mt-1">Click to view details</p>' : ''}
+      </div>
+      <button class="toast-close text-gray-400 hover:text-gray-200">
+        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+        </svg>
+      </button>
+    </div>
+  `;
+
+  // Add click handler for navigation
+  if (link) {
+    toast.addEventListener('click', (e) => {
+      // Don't navigate if clicking the close button
+      if (e.target.closest('.toast-close')) {
+        return;
+      }
+      router.navigate(link);
+      toast.remove();
+    });
+  }
+
+  // Add close button handler
+  const closeBtn = toast.querySelector('.toast-close');
+  closeBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    toast.style.opacity = '0';
+    toast.style.transform = 'translateX(100%)';
+    setTimeout(() => toast.remove(), 300);
+  });
+
+  toastContainer.appendChild(toast);
+
+  // Auto-dismiss after 5 seconds
+  setTimeout(() => {
+    if (toast.parentElement) {
+      toast.style.opacity = '0';
+      toast.style.transform = 'translateX(100%)';
+      setTimeout(() => toast.remove(), 300);
+    }
+  }, 5000);
+}
+
+// Make showToast available globally
+window.showToast = showToast;
+
+/**
+ * Start polling for metrics updates when WebSocket is unavailable
+ * @param {string} serverId - Server ID to poll for
+ */
+function startPolling(serverId) {
+  if (pollingEnabled) {
+    return; // Already polling
+  }
+
+  console.log('Starting polling fallback mechanism');
+  pollingEnabled = true;
+  pollingRetryCount = 0;
+  pollingRetryDelay = 30000; // Reset to 30 seconds
+
+  // Clear any existing interval
+  if (autoRefreshInterval) {
+    clearInterval(autoRefreshInterval);
+    autoRefreshInterval = null;
+  }
+
+  // Start polling
+  pollMetrics(serverId);
+}
+
+/**
+ * Stop polling for metrics updates
+ */
+function stopPolling() {
+  if (!pollingEnabled) {
+    return;
+  }
+
+  console.log('Stopping polling fallback mechanism');
+  pollingEnabled = false;
+  pollingRetryCount = 0;
+  pollingRetryDelay = 30000;
+
+  if (autoRefreshInterval) {
+    clearInterval(autoRefreshInterval);
+    autoRefreshInterval = null;
+  }
+}
+
+/**
+ * Poll for metrics updates with exponential backoff on failure
+ * @param {string} serverId - Server ID to poll for
+ */
+async function pollMetrics(serverId) {
+  if (!pollingEnabled) {
+    return;
+  }
+
+  try {
+    const period = document.getElementById('period-selector')?.value || 'day';
+    await loadDashboardData(serverId, period);
+
+    // Success - reset retry count and delay
+    pollingRetryCount = 0;
+    pollingRetryDelay = 30000;
+
+    // Schedule next poll in 30 seconds
+    autoRefreshInterval = setTimeout(() => {
+      pollMetrics(serverId);
+    }, 30000);
+
+  } catch (error) {
+    console.error('Polling failed:', error);
+    pollingRetryCount++;
+
+    // Calculate exponential backoff delay
+    const delay = Math.min(
+      pollingRetryDelay * Math.pow(2, pollingRetryCount - 1),
+      MAX_POLLING_RETRY_DELAY
+    );
+
+    console.log(`Retrying poll in ${delay / 1000} seconds (attempt ${pollingRetryCount})`);
+
+    // Schedule retry with exponential backoff
+    autoRefreshInterval = setTimeout(() => {
+      pollMetrics(serverId);
+    }, delay);
+  }
+}
+
+/**
+ * Update the last data update timestamp
+ */
+function updateLastDataTimestamp() {
+  lastDataUpdate = new Date();
+  updateDataFreshnessIndicator();
+}
+
+/**
+ * Update the data freshness indicator in the UI
+ */
+function updateDataFreshnessIndicator() {
+  const indicator = document.getElementById('data-freshness-indicator');
+  if (!indicator || !lastDataUpdate) {
+    return;
+  }
+
+  const now = new Date();
+  const ageMs = now - lastDataUpdate;
+  const ageSeconds = Math.floor(ageMs / 1000);
+  const ageMinutes = Math.floor(ageSeconds / 60);
+
+  // Format the timestamp
+  let timeAgo;
+  if (ageSeconds < 60) {
+    timeAgo = `${ageSeconds}s ago`;
+  } else if (ageMinutes < 60) {
+    timeAgo = `${ageMinutes}m ago`;
+  } else {
+    const ageHours = Math.floor(ageMinutes / 60);
+    timeAgo = `${ageHours}h ago`;
+  }
+
+  // Check if data is stale (older than 2 minutes)
+  const isStale = ageMs > 120000;
+
+  indicator.innerHTML = `
+    <div class="flex items-center gap-2 text-sm">
+      <svg class="w-4 h-4 ${isStale ? 'text-yellow-400' : 'text-gray-400'}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+      </svg>
+      <span class="${isStale ? 'text-yellow-400' : 'text-gray-400'}">
+        Last updated: ${timeAgo}
+        ${isStale ? '<span class="ml-2 px-2 py-0.5 bg-yellow-500 bg-opacity-20 text-yellow-400 rounded text-xs">Stale</span>' : ''}
+      </span>
+    </div>
+  `;
+}
 
 // Fetch client config on load
 async function loadClientConfig() {
@@ -28,10 +464,7 @@ async function loadClientConfig() {
  * Get color for health score
  */
 function getHealthScoreColor(score) {
-  if (score >= 90) return '#10b981'; // green
-  if (score >= 70) return '#f59e0b'; // yellow
-  if (score >= 50) return '#f97316'; // orange
-  return '#ef4444'; // red
+  return themeManager.getHealthScoreColor(score);
 }
 
 /**
@@ -61,6 +494,10 @@ function renderNavbar(serverName) {
             <h1 class="text-xl font-bold text-indigo-400">Murdoch</h1>
             <span class="text-gray-400">|</span>
             <span class="text-gray-300">${serverName || 'Dashboard'}</span>
+            <div id="ws-connection-status" class="connection-status disconnected">
+              <span class="connection-status-dot"></span>
+              <span class="connection-status-text">Disconnected</span>
+            </div>
           </div>
           
           <div class="flex items-center gap-4">
@@ -69,6 +506,14 @@ function renderNavbar(serverName) {
             <a href="#/rules" class="text-gray-300 hover:text-white px-3 py-2 rounded-md text-sm font-medium">Rules</a>
             <a href="#/config" class="text-gray-300 hover:text-white px-3 py-2 rounded-md text-sm font-medium">Config</a>
             <a href="#/warnings" class="text-gray-300 hover:text-white px-3 py-2 rounded-md text-sm font-medium">Warnings</a>
+            <button id="theme-toggle" class="p-2 rounded-md text-gray-300 hover:text-white hover:bg-gray-700 transition-colors" title="Toggle theme">
+              <svg class="w-5 h-5 theme-icon-sun hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364 6.364l-.707-.707M6.343 6.343l-.707-.707m12.728 0l-.707.707M6.343 17.657l-.707.707M16 12a4 4 0 11-8 0 4 4 0 018 0z" />
+              </svg>
+              <svg class="w-5 h-5 theme-icon-moon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z" />
+              </svg>
+            </button>
             <button onclick="window.router.navigate('/servers')" class="btn btn-secondary btn-sm">
               Change Server
             </button>
@@ -122,15 +567,25 @@ function renderLoginPage() {
 
 // Initialize the application
 async function init() {
-  // Make auth available globally for inline handlers
+  // Make auth and api available globally for inline handlers
   window.auth = auth;
   window.api = api;
+  window.themeManager = themeManager;
+  window.notificationCenter = notificationCenter;
 
   // Load client config
   await loadClientConfig();
 
+  // Initialize notification center
+  await notificationCenter.init();
+
   // Set up router
   setupRoutes();
+
+  // Initialize pull-to-refresh for mobile devices
+  if (isMobileDevice()) {
+    initPullToRefresh();
+  }
 
   // Initialize router
   router.init();
@@ -146,10 +601,52 @@ function setupRoutes() {
 
   // Protected routes
   router.register('/servers', renderServerSelector, { requiresAuth: true });
-  router.register('/dashboard', renderDashboard, { requiresAuth: true });
-  router.register('/violations', renderViolationsPage, { requiresAuth: true });
-  router.register('/rules', renderRulesPage, { requiresAuth: true });
-  router.register('/config', renderConfigPage, { requiresAuth: true });
+
+  // Single-page dashboard - main entry point
+  router.register('/dashboard', renderSinglePageDashboard, { requiresAuth: true });
+
+  // Backward compatibility redirects - redirect old routes to single-page with section hash
+  router.register('/violations', () => {
+    // Cleanup current dashboard if exists
+    if (window.currentDashboard) {
+      window.currentDashboard.destroy();
+    }
+    renderSinglePageDashboard();
+    setTimeout(() => {
+      const section = document.getElementById('violations-section');
+      if (section) {
+        section.scrollIntoView({ behavior: 'smooth' });
+      }
+    }, 100);
+  }, { requiresAuth: true });
+
+  router.register('/rules', () => {
+    if (window.currentDashboard) {
+      window.currentDashboard.destroy();
+    }
+    renderSinglePageDashboard();
+    setTimeout(() => {
+      const section = document.getElementById('rules-section');
+      if (section) {
+        section.scrollIntoView({ behavior: 'smooth' });
+      }
+    }, 100);
+  }, { requiresAuth: true });
+
+  router.register('/config', () => {
+    if (window.currentDashboard) {
+      window.currentDashboard.destroy();
+    }
+    renderSinglePageDashboard();
+    setTimeout(() => {
+      const section = document.getElementById('config-section');
+      if (section) {
+        section.scrollIntoView({ behavior: 'smooth' });
+      }
+    }, 100);
+  }, { requiresAuth: true });
+
+  // Keep warnings and analytics as separate pages for now (could be added to single-page later)
   router.register('/warnings', renderWarningsPage, { requiresAuth: true });
   router.register('/rule-effectiveness', renderRuleEffectivenessPage, { requiresAuth: true });
   router.register('/temporal', renderTemporalAnalyticsPage, { requiresAuth: true });
@@ -175,7 +672,25 @@ function setupRoutes() {
     // Clear any auto-refresh intervals when navigating away
     if (autoRefreshInterval) {
       clearInterval(autoRefreshInterval);
+      clearTimeout(autoRefreshInterval);
       autoRefreshInterval = null;
+    }
+
+    // Clear freshness interval when leaving dashboard
+    if (window.freshnessInterval) {
+      clearInterval(window.freshnessInterval);
+      window.freshnessInterval = null;
+    }
+
+    // Cleanup single-page dashboard when leaving
+    if (window.currentDashboard && to.path === '/servers') {
+      window.currentDashboard.destroy();
+      window.currentDashboard = null;
+    }
+
+    // Stop polling when leaving dashboard
+    if (from?.path === '/dashboard' && to.path !== '/dashboard') {
+      stopPolling();
     }
 
     // If going to login page and already authenticated, redirect to servers
@@ -344,7 +859,10 @@ async function renderDashboard() {
     <div class="min-h-screen bg-gray-900 pt-16">
       <div class="max-w-7xl mx-auto px-4 py-8">
         <div class="flex justify-between items-center mb-6">
-          <h1 class="text-3xl font-bold text-gray-100">Dashboard</h1>
+          <div class="flex-1">
+            <h1 class="text-3xl font-bold text-gray-100">Dashboard</h1>
+            <div id="data-freshness-indicator" class="mt-2"></div>
+          </div>
           <div class="flex gap-4 items-center">
             <select id="period-selector" class="form-select w-auto">
               <option value="hour">Last Hour</option>
@@ -385,11 +903,13 @@ async function renderDashboard() {
   // Load initial data
   await loadDashboardData(serverId, 'day');
 
-  // Set up auto-refresh every 60 seconds
-  autoRefreshInterval = setInterval(() => {
-    const period = document.getElementById('period-selector').value;
-    loadDashboardData(serverId, period);
-  }, 60000);
+  // Set up interval to update data freshness indicator every 10 seconds
+  const freshnessInterval = setInterval(() => {
+    updateDataFreshnessIndicator();
+  }, 10000);
+
+  // Store interval ID for cleanup
+  window.freshnessInterval = freshnessInterval;
 }
 
 /**
@@ -412,8 +932,9 @@ async function loadDashboardData(serverId, period) {
         <div class="card">
           <div class="flex items-center justify-between">
             <div>
-              <p class="text-gray-400 text-sm mb-1">Total Messages</p>
-              <p class="text-3xl font-bold text-gray-100">${metrics.messages_processed.toLocaleString()}</p>
+              <p class="text-gray-400 text-sm mb-1">Messages Scanned</p>
+              <p class="text-3xl font-bold text-gray-100">${metrics.messages_processed > 0 ? metrics.messages_processed.toLocaleString() : '—'}</p>
+              ${metrics.messages_processed === 0 ? '<p class="text-gray-500 text-xs mt-1">Tracking resets on restart</p>' : ''}
             </div>
             <div class="bg-indigo-500 bg-opacity-20 p-3 rounded-lg">
               <svg class="w-8 h-8 text-indigo-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -477,7 +998,7 @@ async function loadDashboardData(serverId, period) {
                 </div>
               </div>
             </div>
-            ${healthMetrics.health_score < 70 ? '<div class="mt-2 text-yellow-400 text-sm">⚠️ Needs Attention</div>' : ''}
+            ${healthMetrics.limited_data ? '<div class="mt-2 text-blue-400 text-sm">ℹ️ Limited Data</div>' : healthMetrics.health_score < 70 ? '<div class="mt-2 text-yellow-400 text-sm">⚠️ Needs Attention</div>' : ''}
           </div>
 
           <!-- Violation Rate -->
@@ -535,9 +1056,9 @@ async function loadDashboardData(serverId, period) {
 
       <!-- Charts -->
       <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8">
-        <!-- Messages Over Time -->
+        <!-- Activity Over Time -->
         <div class="card">
-          <h3 class="text-lg font-semibold text-gray-100 mb-4">Messages Over Time</h3>
+          <h3 class="text-lg font-semibold text-gray-100 mb-4">Activity Over Time</h3>
           <div class="chart-container">
             <canvas id="messages-chart"></canvas>
           </div>
@@ -559,6 +1080,15 @@ async function loadDashboardData(serverId, period) {
             <h3 class="text-lg font-semibold text-gray-100">Top Offenders</h3>
             <a href="#/offenders" class="text-indigo-400 hover:text-indigo-300 text-sm">View All →</a>
           </div>
+          ${topOffenders.top_users.length === 0 ? `
+            <div class="text-center py-12">
+              <svg class="w-16 h-16 mx-auto text-gray-600 mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z" />
+              </svg>
+              <p class="text-gray-400 mb-2">No violations recorded</p>
+              <p class="text-gray-500 text-sm">Your server is clean! Top offenders will appear here once violations are detected</p>
+            </div>
+          ` : `
           <div class="overflow-x-auto">
             <table class="table">
               <thead>
@@ -586,6 +1116,7 @@ async function loadDashboardData(serverId, period) {
               </tbody>
             </table>
           </div>
+          `}
           <div class="mt-4 pt-4 border-t border-gray-700">
             <p class="text-sm text-gray-400">
               <span class="font-semibold text-gray-300">${topOffenders.moderated_users_pct.toFixed(1)}%</span> of users have been moderated
@@ -617,6 +1148,9 @@ async function loadDashboardData(serverId, period) {
     renderSeverityChart(metrics.violations_by_severity);
     renderDistributionChart(topOffenders.violation_distribution);
 
+    // Update last data timestamp
+    updateLastDataTimestamp();
+
   } catch (error) {
     console.error('Failed to load dashboard data:', error);
     content.innerHTML = `
@@ -629,7 +1163,7 @@ async function loadDashboardData(serverId, period) {
 }
 
 /**
- * Render messages over time line chart
+ * Render activity over time line chart
  */
 function renderMessagesChart(timeSeries) {
   const ctx = document.getElementById('messages-chart');
@@ -637,28 +1171,32 @@ function renderMessagesChart(timeSeries) {
 
   // Handle missing or empty time series data
   if (!timeSeries || !Array.isArray(timeSeries) || timeSeries.length === 0) {
-    ctx.parentElement.innerHTML = '<p class="text-gray-500 text-center py-8">No time series data available</p>';
+    ctx.parentElement.innerHTML = `
+      <div class="text-center py-8">
+        <svg class="w-12 h-12 mx-auto text-gray-600 mb-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
+        </svg>
+        <p class="text-gray-400 mb-2">No activity data yet</p>
+        <p class="text-gray-500 text-sm">Violations will appear here once detected</p>
+      </div>
+    `;
     return;
   }
 
-  new Chart(ctx, {
+  const colors = themeManager.getChartColors();
+
+  new Chart(ctx, getOptimizedChartOptions({
     type: 'line',
     data: {
       labels: timeSeries.map(point => new Date(point.timestamp).toLocaleTimeString()),
       datasets: [
         {
-          label: 'Messages',
-          data: timeSeries.map(point => point.messages),
-          borderColor: '#6366f1',
-          backgroundColor: 'rgba(99, 102, 241, 0.1)',
-          tension: 0.4,
-        },
-        {
           label: 'Violations',
           data: timeSeries.map(point => point.violations),
-          borderColor: '#ef4444',
-          backgroundColor: 'rgba(239, 68, 68, 0.1)',
+          borderColor: colors.danger,
+          backgroundColor: colors.danger + '1a',
           tension: 0.4,
+          fill: true,
         }
       ]
     },
@@ -667,7 +1205,7 @@ function renderMessagesChart(timeSeries) {
       maintainAspectRatio: false,
       plugins: {
         legend: {
-          labels: { color: '#d1d5db' }
+          labels: { color: colors.text }
         },
         tooltip: {
           mode: 'index',
@@ -676,16 +1214,17 @@ function renderMessagesChart(timeSeries) {
       },
       scales: {
         x: {
-          ticks: { color: '#9ca3af' },
-          grid: { color: '#374151' }
+          ticks: { color: colors.text },
+          grid: { color: colors.grid }
         },
         y: {
-          ticks: { color: '#9ca3af' },
-          grid: { color: '#374151' }
+          ticks: { color: colors.text },
+          grid: { color: colors.grid },
+          beginAtZero: true
         }
       }
     }
-  });
+  }));
 }
 
 /**
@@ -697,24 +1236,51 @@ function renderTypeChart(violationsByType) {
 
   // Handle missing or empty data
   if (!violationsByType || typeof violationsByType !== 'object' || Object.keys(violationsByType).length === 0) {
-    ctx.parentElement.innerHTML = '<p class="text-gray-500 text-center py-8">No violation type data available</p>';
+    ctx.parentElement.innerHTML = `
+      <div class="text-center py-8">
+        <svg class="w-12 h-12 mx-auto text-gray-600 mb-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+        </svg>
+        <p class="text-gray-400 mb-2">No violations detected</p>
+        <p class="text-gray-500 text-sm">Your server is clean! Violation types will be tracked here</p>
+      </div>
+    `;
     return;
   }
 
-  const labels = Object.keys(violationsByType);
-  const data = Object.values(violationsByType);
+  // Check if all values are zero
+  const totalViolations = Object.values(violationsByType).reduce((a, b) => a + b, 0);
+  if (totalViolations === 0) {
+    ctx.parentElement.innerHTML = `
+      <div class="text-center py-8">
+        <svg class="w-12 h-12 mx-auto text-gray-600 mb-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+        </svg>
+        <p class="text-gray-400 mb-2">No violations detected</p>
+        <p class="text-gray-500 text-sm">Your server is clean! Violation types will be tracked here</p>
+      </div>
+    `;
+    return;
+  }
 
-  new Chart(ctx, {
+  // Filter out zero values and format labels nicely
+  const displayLabels = { 'regex': 'Regex', 'ai': 'AI', 'manual': 'Manual' };
+  const filteredEntries = Object.entries(violationsByType).filter(([, v]) => v > 0);
+  const labels = filteredEntries.map(([k]) => displayLabels[k] || k);
+  const data = filteredEntries.map(([, v]) => v);
+  const colors = themeManager.getChartColors();
+
+  new Chart(ctx, getOptimizedChartOptions({
     type: 'pie',
     data: {
       labels: labels,
       datasets: [{
         data: data,
         backgroundColor: [
-          '#6366f1',
+          colors.primary,
           '#8b5cf6',
           '#ec4899',
-          '#f59e0b',
+          colors.warning,
         ]
       }]
     },
@@ -724,11 +1290,11 @@ function renderTypeChart(violationsByType) {
       plugins: {
         legend: {
           position: 'bottom',
-          labels: { color: '#d1d5db' }
+          labels: { color: colors.text }
         }
       }
     }
-  });
+  }));
 }
 
 /**
@@ -740,25 +1306,51 @@ function renderSeverityChart(violationsBySeverity) {
 
   // Handle missing or empty data
   if (!violationsBySeverity || typeof violationsBySeverity !== 'object' || Object.keys(violationsBySeverity).length === 0) {
-    ctx.parentElement.innerHTML = '<p class="text-gray-500 text-center py-8">No severity data available</p>';
+    ctx.parentElement.innerHTML = `
+      <div class="text-center py-8">
+        <svg class="w-12 h-12 mx-auto text-gray-600 mb-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+        </svg>
+        <p class="text-gray-400 mb-2">No violations by severity</p>
+        <p class="text-gray-500 text-sm">Severity levels will be tracked here once violations occur</p>
+      </div>
+    `;
     return;
   }
 
-  const severityOrder = ['Low', 'Medium', 'High', 'Critical'];
-  const labels = severityOrder.filter(s => violationsBySeverity[s] !== undefined);
+  // Check if all values are zero
+  const totalViolations = Object.values(violationsBySeverity).reduce((a, b) => a + b, 0);
+  if (totalViolations === 0) {
+    ctx.parentElement.innerHTML = `
+      <div class="text-center py-8">
+        <svg class="w-12 h-12 mx-auto text-gray-600 mb-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+        </svg>
+        <p class="text-gray-400 mb-2">No violations by severity</p>
+        <p class="text-gray-500 text-sm">Severity levels will be tracked here once violations occur</p>
+      </div>
+    `;
+    return;
+  }
+
+  // Support both lowercase and capitalized keys from backend
+  const severityOrder = ['low', 'medium', 'high', 'critical'];
+  const displayLabels = { 'low': 'Low', 'medium': 'Medium', 'high': 'High', 'critical': 'Critical' };
+  const labels = severityOrder.filter(s => violationsBySeverity[s] !== undefined && violationsBySeverity[s] > 0);
   const data = labels.map(s => violationsBySeverity[s]);
+  const chartColors = themeManager.getChartColors();
 
   const colors = {
-    'Low': '#10b981',
-    'Medium': '#f59e0b',
-    'High': '#f97316',
-    'Critical': '#ef4444'
+    'low': chartColors.success,
+    'medium': chartColors.warning,
+    'high': '#f97316',
+    'critical': chartColors.danger
   };
 
-  new Chart(ctx, {
+  new Chart(ctx, getOptimizedChartOptions({
     type: 'bar',
     data: {
-      labels: labels,
+      labels: labels.map(l => displayLabels[l]),
       datasets: [{
         label: 'Violations',
         data: data,
@@ -775,16 +1367,16 @@ function renderSeverityChart(violationsBySeverity) {
       },
       scales: {
         x: {
-          ticks: { color: '#9ca3af' },
+          ticks: { color: chartColors.text },
           grid: { display: false }
         },
         y: {
-          ticks: { color: '#9ca3af' },
-          grid: { color: '#374151' }
+          ticks: { color: chartColors.text },
+          grid: { color: chartColors.grid }
         }
       }
     }
-  });
+  }));
 }
 
 /**
@@ -796,7 +1388,15 @@ function renderDistributionChart(distribution) {
 
   // Handle missing or empty data
   if (!distribution || typeof distribution !== 'object' || Object.keys(distribution).length === 0) {
-    ctx.parentElement.innerHTML = '<p class="text-gray-500 text-center py-8">No distribution data available</p>';
+    ctx.parentElement.innerHTML = `
+      <div class="text-center py-8">
+        <svg class="w-12 h-12 mx-auto text-gray-600 mb-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z" />
+        </svg>
+        <p class="text-gray-400 mb-2">No user violations yet</p>
+        <p class="text-gray-500 text-sm">User violation patterns will be displayed here</p>
+      </div>
+    `;
     return;
   }
 
@@ -808,15 +1408,16 @@ function renderDistributionChart(distribution) {
 
   const labels = entries.map(e => `${e.count} violation${e.count > 1 ? 's' : ''}`);
   const data = entries.map(e => e.users);
+  const colors = themeManager.getChartColors();
 
-  new Chart(ctx, {
+  new Chart(ctx, getOptimizedChartOptions({
     type: 'bar',
     data: {
       labels: labels,
       datasets: [{
         label: 'Number of Users',
         data: data,
-        backgroundColor: '#6366f1'
+        backgroundColor: colors.primary
       }]
     },
     options: {
@@ -829,16 +1430,16 @@ function renderDistributionChart(distribution) {
       },
       scales: {
         x: {
-          ticks: { color: '#9ca3af' },
+          ticks: { color: colors.text },
           grid: { display: false }
         },
         y: {
-          ticks: { color: '#9ca3af' },
-          grid: { color: '#374151' }
+          ticks: { color: colors.text },
+          grid: { color: colors.grid }
         }
       }
     }
-  });
+  }));
 }
 
 /**
@@ -876,18 +1477,17 @@ async function renderViolationsPage() {
               <label class="form-label">Severity</label>
               <select id="severity-filter" class="form-select">
                 <option value="">All</option>
-                <option value="Low">Low</option>
-                <option value="Medium">Medium</option>
-                <option value="High">High</option>
-                <option value="Critical">Critical</option>
+                <option value="low">Low</option>
+                <option value="medium">Medium</option>
+                <option value="high">High</option>
               </select>
             </div>
             <div class="form-group mb-0">
               <label class="form-label">Detection Type</label>
               <select id="type-filter" class="form-select">
                 <option value="">All</option>
-                <option value="Regex">Regex</option>
-                <option value="AI">AI</option>
+                <option value="regex">Regex</option>
+                <option value="ai">AI</option>
               </select>
             </div>
             <div class="form-group mb-0">
@@ -1740,7 +2340,10 @@ async function loadWarnings(serverId, search = '') {
   try {
     const response = await api.getWarnings(serverId, search);
 
-    if (response.users.length === 0) {
+    // Backend returns 'warnings' not 'users'
+    const warnings = response.warnings || [];
+
+    if (warnings.length === 0) {
       content.innerHTML = `
         <div class="card text-center py-12">
           <svg class="w-16 h-16 mx-auto text-gray-600 mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -1758,28 +2361,26 @@ async function loadWarnings(serverId, search = '') {
           <table class="table">
             <thead>
               <tr>
-                <th>User</th>
+                <th>User ID</th>
                 <th>Warning Level</th>
-                <th>Violation Count</th>
                 <th>Last Violation</th>
-                <th>Kicked</th>
+                <th>Kicked Before</th>
                 <th>Actions</th>
               </tr>
             </thead>
             <tbody>
-              ${response.users.map(user => `
+              ${warnings.map(user => `
                 <tr>
-                  <td class="font-medium">${user.username || user.user_id}</td>
+                  <td class="font-medium font-mono text-sm">${user.user_id}</td>
                   <td>
                     <div class="flex items-center gap-1">
-                      ${Array(user.warning_level).fill('⚠️').join('')}
-                      <span class="text-sm text-gray-400 ml-2">Level ${user.warning_level}</span>
+                      ${Array(user.level || 0).fill('⚠️').join('')}
+                      <span class="text-sm text-gray-400 ml-2">Level ${user.level || 0}</span>
                     </div>
                   </td>
-                  <td><span class="badge badge-high">${user.violation_count}</span></td>
-                  <td class="text-sm text-gray-400">${new Date(user.last_violation).toLocaleString()}</td>
+                  <td class="text-sm text-gray-400">${user.last_violation ? new Date(user.last_violation).toLocaleString() : 'N/A'}</td>
                   <td>
-                    ${user.kicked
+                    ${user.kicked_before
         ? '<span class="text-red-400">Yes</span>'
         : '<span class="text-gray-500">No</span>'
       }
@@ -2145,7 +2746,7 @@ function renderTopRulesChart(topRules) {
   const labels = topRules.map(r => r.rule_name.length > 30 ? r.rule_name.substring(0, 30) + '...' : r.rule_name);
   const data = topRules.map(r => r.violation_count);
 
-  new Chart(ctx, {
+  new Chart(ctx, getOptimizedChartOptions({
     type: 'bar',
     data: {
       labels: labels,
@@ -2175,7 +2776,7 @@ function renderTopRulesChart(topRules) {
         }
       }
     }
-  });
+  }));
 }
 
 /**

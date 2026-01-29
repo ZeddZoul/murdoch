@@ -54,6 +54,15 @@ impl SeverityLevel {
             SeverityLevel::Low
         }
     }
+
+    /// Get the string representation of the severity level.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SeverityLevel::High => "High",
+            SeverityLevel::Medium => "Medium",
+            SeverityLevel::Low => "Low",
+        }
+    }
 }
 
 /// Which layer detected the violation.

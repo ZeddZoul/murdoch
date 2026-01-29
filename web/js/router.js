@@ -66,7 +66,16 @@ class Router {
    * Get current route path from hash
    */
   getCurrentPath() {
-    const hash = window.location.hash.slice(1);
+    let hash = window.location.hash.slice(1);
+
+    // Handle section anchors from single-page dashboard (e.g., dashboard-section -> /dashboard)
+    if (hash && hash.endsWith('-section')) {
+      // Store the section for later scrolling, redirect to dashboard
+      const section = hash.replace('-section', '');
+      sessionStorage.setItem('scrollToSection', section);
+      return '/dashboard';
+    }
+
     return hash || this.defaultRoute;
   }
 

@@ -18,8 +18,8 @@ struct GuildCacheEntry {
     cached_at: Instant,
 }
 
-/// How long to cache guild lists (60 seconds).
-const GUILD_CACHE_TTL: Duration = Duration::from_secs(60);
+/// How long to cache guild lists (5 minutes - reduces Discord API calls significantly).
+const GUILD_CACHE_TTL: Duration = Duration::from_secs(300);
 
 /// Discord OAuth2 configuration and handlers.
 pub struct OAuthHandler {

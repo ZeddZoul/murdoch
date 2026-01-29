@@ -573,6 +573,77 @@ CREATE TABLE IF NOT EXISTS audit_log (
     timestamp TEXT DEFAULT CURRENT_TIMESTAMP
 );
 
+-- User information cache
+CREATE TABLE IF NOT EXISTS user_cache (
+    user_id INTEGER PRIMARY KEY,
+    username TEXT NOT NULL,
+    discriminator TEXT,
+    avatar TEXT,
+    cached_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Role assignments for RBAC
+CREATE TABLE IF NOT EXISTS role_assignments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    role TEXT NOT NULL CHECK(role IN ('owner', 'admin', 'moderator', 'viewer')),
+    assigned_by INTEGER NOT NULL,
+    assigned_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(guild_id, user_id)
+);
+
+-- Notification preferences per guild
+CREATE TABLE IF NOT EXISTS notification_preferences (
+    guild_id INTEGER PRIMARY KEY,
+    discord_webhook_url TEXT,
+    email_addresses TEXT,
+    slack_webhook_url TEXT,
+    notification_threshold TEXT NOT NULL DEFAULT 'medium' CHECK(notification_threshold IN ('low', 'medium', 'high', 'critical')),
+    enabled_events TEXT NOT NULL DEFAULT '[]',
+    muted_until TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Export history tracking
+CREATE TABLE IF NOT EXISTS export_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id INTEGER NOT NULL,
+    export_type TEXT NOT NULL,
+    format TEXT NOT NULL,
+    file_path TEXT,
+    file_size INTEGER,
+    record_count INTEGER,
+    requested_by INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    expires_at TEXT
+);
+
+-- In-app notifications
+CREATE TABLE IF NOT EXISTS notifications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id INTEGER NOT NULL,
+    user_id INTEGER,
+    type TEXT NOT NULL,
+    title TEXT NOT NULL,
+    message TEXT NOT NULL,
+    priority TEXT NOT NULL CHECK(priority IN ('low', 'medium', 'high', 'critical')),
+    read INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Backup history tracking
+CREATE TABLE IF NOT EXISTS backup_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    file_path TEXT NOT NULL,
+    file_size INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    verified INTEGER NOT NULL DEFAULT 0,
+    verification_error TEXT
+);
+
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_warnings_user_guild ON user_warnings(user_id, guild_id);
 CREATE INDEX IF NOT EXISTS idx_violations_user_guild ON violations(user_id, guild_id);
@@ -582,6 +653,14 @@ CREATE INDEX IF NOT EXISTS idx_metrics_guild_hour ON metrics_hourly(guild_id, ho
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(token_expires_at);
 CREATE INDEX IF NOT EXISTS idx_audit_guild ON audit_log(guild_id);
+CREATE INDEX IF NOT EXISTS idx_user_cache_updated ON user_cache(updated_at);
+CREATE INDEX IF NOT EXISTS idx_role_assignments_guild ON role_assignments(guild_id);
+CREATE INDEX IF NOT EXISTS idx_export_history_guild ON export_history(guild_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_notifications_guild_user ON notifications(guild_id, user_id, read);
+CREATE INDEX IF NOT EXISTS idx_violations_guild_timestamp ON violations(guild_id, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_violations_severity ON violations(severity);
+CREATE INDEX IF NOT EXISTS idx_user_warnings_guild ON user_warnings(guild_id);
+CREATE INDEX IF NOT EXISTS idx_metrics_hourly_guild_hour ON metrics_hourly(guild_id, hour DESC);
 "#;
 
 #[cfg(test)]

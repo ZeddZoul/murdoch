@@ -108,7 +108,7 @@ impl MetricsCounters {
 }
 
 /// Metrics snapshot for display.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct MetricsSnapshot {
     pub guild_id: u64,
     pub period: String,
@@ -196,6 +196,10 @@ impl MetricsCollector {
                 let start = Utc::now() - chrono::Duration::weeks(1);
                 (start, "week")
             }
+            "month" => {
+                let start = Utc::now() - chrono::Duration::days(30);
+                (start, "month")
+            }
             _ => {
                 let start = Utc::now() - chrono::Duration::hours(1);
                 (start, "hour")
@@ -243,11 +247,13 @@ impl MetricsCollector {
     }
 
     /// Query historical metrics from database.
+    /// Falls back to querying violations table directly if metrics_hourly is empty.
     pub async fn query_historical(
         &self,
         guild_id: u64,
         since: DateTime<Utc>,
     ) -> Result<MetricsCounters> {
+        // First try metrics_hourly table
         let rows = sqlx::query(
             "SELECT messages_processed, regex_violations, ai_violations,
                     high_severity, medium_severity, low_severity, avg_response_time_ms
@@ -261,13 +267,54 @@ impl MetricsCollector {
         .map_err(|e| MurdochError::Database(format!("Failed to query metrics: {}", e)))?;
 
         let mut counters = MetricsCounters::default();
-        for row in rows {
+        for row in &rows {
             counters.messages_processed += row.get::<i64, _>("messages_processed") as u64;
             counters.regex_violations += row.get::<i64, _>("regex_violations") as u64;
             counters.ai_violations += row.get::<i64, _>("ai_violations") as u64;
             counters.high_severity += row.get::<i64, _>("high_severity") as u64;
             counters.medium_severity += row.get::<i64, _>("medium_severity") as u64;
             counters.low_severity += row.get::<i64, _>("low_severity") as u64;
+        }
+
+        // If no data in metrics_hourly, fall back to querying violations table directly
+        if rows.is_empty() {
+            let since_str = since.format("%Y-%m-%d %H:%M:%S").to_string();
+
+            // Query violations grouped by detection_type and severity
+            let violation_rows = sqlx::query(
+                "SELECT detection_type, severity, COUNT(*) as count
+                 FROM violations
+                 WHERE guild_id = ? AND timestamp >= ?
+                 GROUP BY detection_type, severity",
+            )
+            .bind(guild_id as i64)
+            .bind(&since_str)
+            .fetch_all(self.db.pool())
+            .await
+            .unwrap_or_default();
+
+            for row in violation_rows {
+                let detection_type: String = row.get("detection_type");
+                let severity: String = row.get("severity");
+                let count: i64 = row.get("count");
+
+                match detection_type.as_str() {
+                    "regex" => counters.regex_violations += count as u64,
+                    "ai" => counters.ai_violations += count as u64,
+                    _ => counters.ai_violations += count as u64,
+                }
+
+                match severity.as_str() {
+                    "high" => counters.high_severity += count as u64,
+                    "medium" => counters.medium_severity += count as u64,
+                    "low" => counters.low_severity += count as u64,
+                    _ => counters.low_severity += count as u64,
+                }
+            }
+
+            // Get message count from a simple heuristic or server_configs
+            // For now, we'll estimate based on violations (this is a fallback)
+            // In production, you'd want to track messages in a separate table
         }
 
         Ok(counters)

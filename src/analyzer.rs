@@ -1,6 +1,6 @@
 //! Layer 3: Gemini-powered semantic analysis.
 //!
-//! Sends batched messages to Gemini 2.0 Flash for AI-powered content moderation.
+//! Sends batched messages to Gemini 3.0 Flash for AI-powered content moderation.
 
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -13,9 +13,9 @@ use crate::context::ConversationContext;
 use crate::error::{MurdochError, Result};
 use crate::models::{BufferedMessage, SeverityLevel, Violation};
 
-/// Gemini 2.0 Flash API endpoint.
+/// Gemini 3.0 Flash API endpoint.
 const GEMINI_API_URL: &str =
-    "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent";
+    "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent";
 
 /// System prompt for content moderation.
 const MODERATION_SYSTEM_PROMPT: &str = r#"You are a content moderation assistant. Analyze the following Discord messages for:
@@ -37,6 +37,12 @@ If no violations are found, respond with: {"violations": []}"#;
 const ENHANCED_MODERATION_PROMPT: &str = r#"You are an advanced content moderation assistant for Discord. Your task is to analyze messages with full context awareness.
 
 ## Analysis Guidelines
+
+### Server-Specific Rules (HIGHEST PRIORITY)
+- If server-specific rules are provided, you MUST enforce them strictly
+- Any message violating a server rule is a violation, even if it seems harmless otherwise
+- Server rules override default behavior - if a server bans something specific (like palindromes), flag it
+- Common custom rules to watch for: word bans, topic restrictions, formatting requirements, language restrictions
 
 ### Tone Detection
 - Positive indicators: 😂🤣😆, "lol", "lmao", "jk", "haha", friendly teasing between friends
@@ -65,7 +71,7 @@ const ENHANCED_MODERATION_PROMPT: &str = r#"You are an advanced content moderati
 You will receive:
 1. Recent conversation context (previous messages)
 2. New messages to analyze
-3. Server-specific rules (if any)
+3. Server-specific rules - THESE MUST BE ENFORCED
 
 ## Output Format
 Respond with JSON:
