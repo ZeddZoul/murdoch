@@ -21,6 +21,7 @@ use crate::error::Result;
 use crate::filter::RegexFilter;
 use crate::models::{BufferedMessage, DetectionLayer, FilterResult, FlushTrigger, SeverityLevel};
 use crate::rules::RulesEngine;
+use crate::database::Database;
 use crate::warnings::WarningSystem;
 
 /// The Mod-Director pipeline orchestrator.
@@ -43,6 +44,8 @@ pub struct ModDirectorPipeline {
     warning_system: Option<Arc<WarningSystem>>,
     /// WebSocket manager for real-time updates.
     websocket_manager: Option<Arc<crate::websocket::WebSocketManager>>,
+    /// Database for server config.
+    database: Option<Arc<Database>>,
 }
 
 impl ModDirectorPipeline {
@@ -62,6 +65,7 @@ impl ModDirectorPipeline {
             rules_engine: None,
             warning_system: None,
             websocket_manager: None,
+            database: None,
         }
     }
 
@@ -81,6 +85,26 @@ impl ModDirectorPipeline {
     ) -> Self {
         self.websocket_manager = Some(websocket_manager);
         self
+    }
+
+    pub fn with_database(mut self, database: Arc<Database>) -> Self {
+        self.database = Some(database);
+        self
+    }
+
+    /// Get server config from database, with defaults if not configured.
+    async fn get_server_config(&self, guild_id: u64) -> crate::database::ServerConfig {
+        if let Some(db) = &self.database {
+            match db.get_server_config(guild_id).await {
+                Ok(config) => config,
+                Err(e) => {
+                    tracing::warn!(guild_id = guild_id, error = %e, "Failed to get server config, using defaults");
+                    crate::database::ServerConfig::new(guild_id)
+                }
+            }
+        } else {
+            crate::database::ServerConfig::new(guild_id)
+        }
     }
 
     /// Runs a message through regex → buffer → Gemini analysis.
@@ -334,11 +358,19 @@ impl ModDirectorPipeline {
 
         // Get channel ID from first message for context
         let channel_id = messages.first().map(|m| m.channel_id.get()).unwrap_or(0);
+        
+        // Get guild_id and server config
+        let guild_id = messages.first().and_then(|m| m.guild_id);
+        let server_config = if let Some(gid) = guild_id {
+            self.get_server_config(gid.get()).await
+        } else {
+            crate::database::ServerConfig::default()
+        };
 
         // Get server rules if available
         let server_rules = if let Some(rules_engine) = &self.rules_engine {
             // Extract guild_id from first message
-            if let Some(guild_id) = messages.first().and_then(|m| m.guild_id) {
+            if let Some(guild_id) = guild_id {
                 match rules_engine.get_rules(guild_id.get()).await {
                     Ok(Some(rules)) => {
                         tracing::debug!(
@@ -417,8 +449,14 @@ impl ModDirectorPipeline {
 
                     let severity = SeverityLevel::from_score(violation.severity);
 
-                    // Only act on medium+ severity
-                    if matches!(severity, SeverityLevel::Low) {
+                    // Skip violations below server's severity threshold
+                    if violation.severity < server_config.severity_threshold {
+                        tracing::debug!(
+                            message_id = %original.message_id,
+                            severity = violation.severity,
+                            threshold = server_config.severity_threshold,
+                            "Skipping violation below threshold"
+                        );
                         continue;
                     }
 

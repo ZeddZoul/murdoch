@@ -260,6 +260,82 @@ Configure how warnings escalate:
 | 5-6           | 1 hour timeout    |
 | 7+            | Ban               |
 
+## Slash Commands
+
+All commands require **Administrator** permission.
+
+### `/murdoch config`
+
+View or modify bot configuration for your server.
+
+```
+/murdoch config                    # View current settings
+/murdoch config setting:threshold value:0.6   # Set severity threshold
+/murdoch config setting:timeout value:30      # Set buffer timeout (seconds)
+```
+
+**Settings:**
+| Setting | Description | Default |
+|---------|-------------|---------|
+| `threshold` | Minimum severity score (0.0-1.0) to trigger action | 0.5 |
+| `timeout` | Buffer timeout in seconds before AI analysis | 30 |
+| `view` | Display all current settings | - |
+
+### `/murdoch stats`
+
+View moderation statistics for your server.
+
+```
+/murdoch stats
+```
+
+Shows recent violations, detection counts by type, and moderation activity.
+
+### `/murdoch warnings`
+
+View warnings for a specific user.
+
+```
+/murdoch warnings user:@username
+```
+
+Displays:
+- Current warning level
+- Whether user was previously kicked
+- Recent violation history (last 5)
+
+### `/murdoch clear`
+
+Clear all warnings for a user.
+
+```
+/murdoch clear user:@username
+```
+
+Resets the user's warning count to zero.
+
+### `/murdoch rules`
+
+Manage server-specific moderation rules.
+
+```
+/murdoch rules action:view                    # View current rules
+/murdoch rules action:upload content:"..."    # Set custom rules
+/murdoch rules action:clear                   # Remove custom rules
+```
+
+Custom rules are passed to the AI analyzer for context-aware moderation.
+
+### `/murdoch dashboard`
+
+View metrics dashboard summary.
+
+```
+/murdoch dashboard                    # Default: last 24 hours
+/murdoch dashboard period:hour        # Last hour
+/murdoch dashboard period:week        # Last week
+```
+
 ## API Endpoints
 
 | Endpoint              | Method    | Description           |

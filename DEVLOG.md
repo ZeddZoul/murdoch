@@ -2928,3 +2928,168 @@ Fly.io deployment verified working:
 - Region: SJC
 - Model: `gemini-3-flash-preview`
 - Status: Healthy, processing violations
+
+---
+
+### January 30, 2026 - Slash Command Fixes & Dashboard Config Integration
+
+#### Session Overview
+
+Fixed slash command parameter parsing and integrated dashboard configuration into the moderation pipeline.
+
+---
+
+#### 1. Slash Command Fixes
+
+Fixed nested subcommand option parsing for `/murdoch warnings` and `/murdoch clear` commands.
+
+**Problem:** Commands were trying to get user parameter directly from `command.data.options.first()`, but for subcommands, options are nested inside the subcommand value.
+
+**Solution:** Extract options from `CommandDataOptionValue::SubCommand` variant before looking for user parameter.
+
+**Files Modified:**
+- `src/commands.rs` - Updated `handle_warnings()` and `handle_clear()` to correctly extract nested options
+
+**Before:**
+```rust
+let user_option = command.data.options.first()
+    .and_then(|o| o.value.as_user_id());
+```
+
+**After:**
+```rust
+let subcommand_options = command.data.options.first().and_then(|o| match &o.value {
+    serenity::all::CommandDataOptionValue::SubCommand(opts) => Some(opts),
+    _ => None,
+});
+let user_option = options.iter()
+    .find(|o| o.name == "user")
+    .and_then(|o| o.value.as_user_id());
+```
+
+---
+
+#### 2. Dashboard Config Integration
+
+Integrated server configuration from dashboard into the moderation pipeline.
+
+**Changes:**
+1. Added `database: Option<Arc<Database>>` field to `ModDirectorPipeline`
+2. Added `with_database()` builder method
+3. Added `get_server_config()` helper method with fallback to defaults
+4. Updated `main.rs` to pass database to pipeline via `.with_database(db.clone())`
+5. Updated `flush_buffer()` to load server config and use `severity_threshold`
+
+**Files Modified:**
+- `src/pipeline.rs` - Added database field, helper method, severity threshold filtering
+- `src/main.rs` - Pass database to pipeline
+
+**Config Applied:**
+| Setting | Usage |
+|---------|-------|
+| `severity_threshold` | Skip violations below this score (default 0.5) |
+
+---
+
+#### 3. Slash Commands Documentation
+
+Added comprehensive slash commands section to README.md:
+
+| Command | Description |
+|---------|-------------|
+| `/murdoch config` | View/modify bot configuration |
+| `/murdoch stats` | View moderation statistics |
+| `/murdoch warnings @user` | View warnings for a user |
+| `/murdoch clear @user` | Clear warnings for a user |
+| `/murdoch rules` | Manage server-specific rules |
+| `/murdoch dashboard` | View metrics summary |
+
+---
+
+#### Test Results
+
+All 259 tests passing:
+
+```
+test result: ok. 259 passed; 0 failed; 0 ignored
+```
+
+---
+
+#### Spec Progress
+
+Updated `.kiro/specs/slash-command-fixes/tasks.md`:
+- ✅ Task 1.1: Fix handle_warnings() option parsing
+- ✅ Task 1.2: Fix handle_clear() option parsing
+- ✅ Task 1.3: Test slash commands in Discord
+- ✅ Task 2.1: Add database to pipeline
+- ✅ Task 2.2: Load server config in flush_buffer()
+- ✅ Task 2.3: Apply severity_threshold to filtering
+- ✅ Task 3.2: Update README with command documentation
+
+---
+
+### January 30, 2026 (continued) - Dashboard UX & Slash Command Production Fix
+
+#### Session Overview
+
+Improved dashboard UX for bot presence detection and resolved production/local slash command conflicts.
+
+---
+
+#### 4. Dashboard Bot Presence Detection
+
+Previously, the dashboard determined bot presence by checking for violation data in the database, which was unreliable.
+
+**Solution:** Use the Discord API to check if the bot is actually a member of each guild.
+
+**Files Modified:**
+- `src/web.rs` - Updated `list_servers` to use `http.get_guild()` for accurate bot presence
+- `src/main.rs` - Pass Discord HTTP client to web AppState
+
+**New User Flow:**
+1. User logs in via Discord OAuth2
+2. Dashboard shows all servers user admins
+3. Servers without bot show "Invite Bot" button
+4. Clicking uses OAuth2 invite URL with correct permissions
+
+---
+
+#### 5. Slash Command Conflict Resolution
+
+When both production (Fly.io) and local bots run with the same token, both receive interactions and race to respond.
+
+**Problem:** Production bot with old code responded first with "Please specify a user" error.
+
+**Solution:**
+1. Added graceful handling of "already acknowledged" errors
+2. Stopped production bot during local testing
+3. Deployed fix to production
+
+**Files Modified:**
+- `src/commands.rs` - Handle duplicate acknowledgment gracefully
+
+---
+
+#### 6. Code Cleanup
+
+Removed debug logging and simplified comments for production readiness.
+
+**Changes:**
+- Removed verbose tracing::debug! statements from `handle_warnings()`
+- Simplified error handling comments in `respond_message()`
+- Verified all 259 tests still pass
+
+---
+
+#### Deployment
+
+Deployed to Fly.io:
+```bash
+flyctl deploy --app murdoch-bot
+```
+
+---
+
+**Status**: All features working, deployed to production
+

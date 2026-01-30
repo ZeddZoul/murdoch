@@ -105,6 +105,7 @@ pub struct AppState {
     pub notification_service: Arc<crate::notification::NotificationService>,
     pub dashboard_url: String,
     pub client_id: String,
+    pub discord_http: Option<Arc<serenity::http::Http>>,
 }
 
 /// Request deduplication service that shares futures for identical in-flight requests.
@@ -906,25 +907,34 @@ async fn list_servers(
 
     tracing::info!("Found {} admin guilds", guilds.len());
 
-    // Check which guilds have bot data (violations, config, etc.)
+    // Check which guilds have the bot present
     let mut servers: Vec<ServerInfo> = Vec::new();
     for g in guilds {
-        let guild_id: i64 = g.id.parse().unwrap_or(0);
+        let guild_id_u64: u64 = g.id.parse().unwrap_or(0);
 
-        // Check if guild has any violations (indicates bot is/was active)
-        let has_data: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM violations WHERE guild_id = ? LIMIT 1)",
-        )
-        .bind(guild_id)
-        .fetch_one(state.db.pool())
-        .await
-        .unwrap_or(false);
+        // Check if bot is actually in this guild by trying to fetch guild info
+        let bot_present = if let Some(http) = &state.discord_http {
+            match http.get_guild(serenity::model::id::GuildId::new(guild_id_u64)).await {
+                Ok(_) => true,
+                Err(_) => false,
+            }
+        } else {
+            // Fallback: check if we have any data for this guild
+            let guild_id: i64 = guild_id_u64 as i64;
+            sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM violations WHERE guild_id = ? LIMIT 1)",
+            )
+            .bind(guild_id)
+            .fetch_one(state.db.pool())
+            .await
+            .unwrap_or(false)
+        };
 
         servers.push(ServerInfo {
             id: g.id,
             name: g.name,
             icon: g.icon,
-            bot_present: has_data,
+            bot_present,
         });
     }
 

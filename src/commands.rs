@@ -312,11 +312,18 @@ impl SlashCommandHandler {
             .guild_id
             .ok_or_else(|| MurdochError::Config("Command must be used in a server".to_string()))?;
 
-        // Get user from options
-        let user_option = command
-            .data
-            .options
-            .first()
+        // Subcommand options are nested inside the subcommand value
+        let subcommand_options = command.data.options.first().and_then(|o| match &o.value {
+            serenity::all::CommandDataOptionValue::SubCommand(opts) => Some(opts),
+            _ => None,
+        });
+
+        let empty_vec = vec![];
+        let options = subcommand_options.unwrap_or(&empty_vec);
+
+        let user_option = options
+            .iter()
+            .find(|o| o.name == "user")
             .and_then(|o| o.value.as_user_id());
 
         let Some(user_id) = user_option else {
@@ -367,11 +374,19 @@ impl SlashCommandHandler {
             .guild_id
             .ok_or_else(|| MurdochError::Config("Command must be used in a server".to_string()))?;
 
-        // Get user from options
-        let user_option = command
-            .data
-            .options
-            .first()
+        // For subcommands, options are nested in the subcommand value
+        let subcommand_options = command.data.options.first().and_then(|o| match &o.value {
+            serenity::all::CommandDataOptionValue::SubCommand(opts) => Some(opts),
+            _ => None,
+        });
+
+        let empty_vec = vec![];
+        let options = subcommand_options.unwrap_or(&empty_vec);
+
+        // Get user from nested options
+        let user_option = options
+            .iter()
+            .find(|o| o.name == "user")
             .and_then(|o| o.value.as_user_id());
 
         let Some(user_id) = user_option else {
@@ -590,12 +605,17 @@ impl SlashCommandHandler {
                 .ephemeral(true),
         );
 
-        command
-            .create_response(&ctx.http, response)
-            .await
-            .map_err(|e| MurdochError::DiscordApi(Box::new(e)))?;
-
-        Ok(())
+        match command.create_response(&ctx.http, response).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // Discord may timeout or another instance may respond first
+                if e.to_string().contains("already been acknowledged") {
+                    Ok(())
+                } else {
+                    Err(MurdochError::DiscordApi(Box::new(e)))
+                }
+            }
+        }
     }
 
     /// Send an error response.

@@ -452,7 +452,8 @@ async fn main() -> Result<()> {
     )
     .with_rules_engine(RulesEngine::new(db.clone()))
     .with_warning_system(warning_system.clone())
-    .with_websocket_manager(websocket_manager.clone());
+    .with_websocket_manager(websocket_manager.clone())
+    .with_database(db.clone());
     let pipeline = Arc::new(pipeline);
 
     // Build slash command handler
@@ -520,6 +521,7 @@ async fn main() -> Result<()> {
             notification_service: notification_service.clone(),
             dashboard_url,
             client_id,
+            discord_http: Some(http.clone()),
         };
 
         let router = web::build_router(web_state);
