@@ -135,7 +135,10 @@ impl GeminiAnalyzer {
         let rate_limiter = Arc::new(GovRateLimiter::direct(quota));
 
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(60))
+            .connect_timeout(Duration::from_secs(30))
+            .pool_idle_timeout(Duration::from_secs(90))
+            .tcp_keepalive(Duration::from_secs(60))
             .build()
             .expect("failed to build HTTP client");
 
@@ -156,33 +159,52 @@ impl GeminiAnalyzer {
 
         let request = self.build_request(&messages);
         let url = format!("{}?key={}", GEMINI_API_URL, self.api_key);
-        let response = self.client.post(&url).json(&request).send().await?;
+        
+        // Retry logic for transient network failures
+        let mut last_error = None;
+        for attempt in 0..3 {
+            if attempt > 0 {
+                let delay = Duration::from_millis(500 * (1 << attempt));
+                tokio::time::sleep(delay).await;
+                tracing::debug!(attempt = attempt + 1, "Retrying Gemini API request");
+            }
+            
+            match self.client.post(&url).json(&request).send().await {
+                Ok(response) => {
+                    // Check for rate limiting
+                    if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                        let retry_after = response
+                            .headers()
+                            .get("retry-after")
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(|s| s.parse::<u64>().ok())
+                            .unwrap_or(60);
 
-        // Check for rate limiting
-        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            let retry_after = response
-                .headers()
-                .get("retry-after")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(60);
+                        return Err(MurdochError::RateLimited {
+                            retry_after_ms: retry_after * 1000,
+                        });
+                    }
 
-            return Err(MurdochError::RateLimited {
-                retry_after_ms: retry_after * 1000,
-            });
+                    if !response.status().is_success() {
+                        let status = response.status();
+                        let body = response.text().await.unwrap_or_default();
+                        return Err(MurdochError::GeminiApi(format!(
+                            "HTTP {}: {}",
+                            status, body
+                        )));
+                    }
+
+                    let gemini_response: GeminiResponse = response.json().await?;
+                    return self.parse_response(gemini_response);
+                }
+                Err(e) => {
+                    tracing::warn!(attempt = attempt + 1, error = %e, "Gemini API request failed");
+                    last_error = Some(e);
+                }
+            }
         }
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(MurdochError::GeminiApi(format!(
-                "HTTP {}: {}",
-                status, body
-            )));
-        }
-
-        let gemini_response: GeminiResponse = response.json().await?;
-        self.parse_response(gemini_response)
+        
+        Err(MurdochError::Http(last_error.unwrap()))
     }
 
     /// Build the Gemini API request.
@@ -253,32 +275,50 @@ impl GeminiAnalyzer {
         let request = self.build_enhanced_request(&messages, &context);
         let url = format!("{}?key={}", GEMINI_API_URL, self.api_key);
 
-        let response = self.client.post(&url).json(&request).send().await?;
+        // Retry logic for transient network failures
+        let mut last_error = None;
+        for attempt in 0..3 {
+            if attempt > 0 {
+                let delay = Duration::from_millis(500 * (1 << attempt));
+                tokio::time::sleep(delay).await;
+                tracing::debug!(attempt = attempt + 1, "Retrying Gemini API request (enhanced)");
+            }
+            
+            match self.client.post(&url).json(&request).send().await {
+                Ok(response) => {
+                    if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                        let retry_after = response
+                            .headers()
+                            .get("retry-after")
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(|s| s.parse::<u64>().ok())
+                            .unwrap_or(60);
 
-        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            let retry_after = response
-                .headers()
-                .get("retry-after")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(60);
+                        return Err(MurdochError::RateLimited {
+                            retry_after_ms: retry_after * 1000,
+                        });
+                    }
 
-            return Err(MurdochError::RateLimited {
-                retry_after_ms: retry_after * 1000,
-            });
+                    if !response.status().is_success() {
+                        let status = response.status();
+                        let body = response.text().await.unwrap_or_default();
+                        return Err(MurdochError::GeminiApi(format!(
+                            "HTTP {}: {}",
+                            status, body
+                        )));
+                    }
+
+                    let gemini_response: GeminiResponse = response.json().await?;
+                    return self.parse_enhanced_response(gemini_response);
+                }
+                Err(e) => {
+                    tracing::warn!(attempt = attempt + 1, error = %e, "Gemini API request failed (enhanced)");
+                    last_error = Some(e);
+                }
+            }
         }
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(MurdochError::GeminiApi(format!(
-                "HTTP {}: {}",
-                status, body
-            )));
-        }
-
-        let gemini_response: GeminiResponse = response.json().await?;
-        self.parse_enhanced_response(gemini_response)
+        
+        Err(MurdochError::Http(last_error.unwrap()))
     }
 
     /// Builds request with the hardened prompt.
