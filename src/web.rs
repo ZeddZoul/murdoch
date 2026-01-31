@@ -914,7 +914,10 @@ async fn list_servers(
 
         // Check if bot is actually in this guild by trying to fetch guild info
         let bot_present = if let Some(http) = &state.discord_http {
-            match http.get_guild(serenity::model::id::GuildId::new(guild_id_u64)).await {
+            match http
+                .get_guild(serenity::model::id::GuildId::new(guild_id_u64))
+                .await
+            {
                 Ok(_) => true,
                 Err(_) => false,
             }

@@ -16,12 +16,12 @@ use tokio::sync::RwLock;
 use crate::analyzer::GeminiAnalyzer;
 use crate::buffer::MessageBuffer;
 use crate::context::{ContextMessage, ContextTracker};
+use crate::database::Database;
 use crate::discord::{DiscordClient, ViolationReportBuilder};
 use crate::error::Result;
 use crate::filter::RegexFilter;
 use crate::models::{BufferedMessage, DetectionLayer, FilterResult, FlushTrigger, SeverityLevel};
 use crate::rules::RulesEngine;
-use crate::database::Database;
 use crate::warnings::WarningSystem;
 
 /// The Mod-Director pipeline orchestrator.
@@ -358,7 +358,7 @@ impl ModDirectorPipeline {
 
         // Get channel ID from first message for context
         let channel_id = messages.first().map(|m| m.channel_id.get()).unwrap_or(0);
-        
+
         // Get guild_id and server config
         let guild_id = messages.first().and_then(|m| m.guild_id);
         let server_config = if let Some(gid) = guild_id {

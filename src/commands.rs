@@ -211,6 +211,96 @@ impl SlashCommandHandler {
             .guild_id
             .ok_or_else(|| MurdochError::Config("Command must be used in a server".to_string()))?;
 
+        // For subcommands, options are nested in the subcommand value
+        let subcommand_options = command.data.options.first().and_then(|o| match &o.value {
+            serenity::all::CommandDataOptionValue::SubCommand(opts) => Some(opts),
+            _ => None,
+        });
+
+        let empty_vec = vec![];
+        let options = subcommand_options.unwrap_or(&empty_vec);
+
+        let setting = options
+            .iter()
+            .find(|o| o.name == "setting")
+            .and_then(|o| o.value.as_str());
+
+        let value = options
+            .iter()
+            .find(|o| o.name == "value")
+            .and_then(|o| o.value.as_f64());
+
+        // If both setting and value are provided, update the config
+        if let (Some(setting_name), Some(new_value)) = (setting, value) {
+            let mut config = self.db.get_server_config(guild_id.get()).await?;
+
+            match setting_name {
+                "threshold" => {
+                    if !(0.0..=1.0).contains(&new_value) {
+                        return self
+                            .respond_error(
+                                ctx,
+                                command,
+                                "Severity threshold must be between 0.0 and 1.0.\n\n\
+                                 💡 **Lower = stricter** (0.2 catches almost everything)\n\
+                                 💡 **Higher = more lenient** (0.8 only catches extreme violations)",
+                            )
+                            .await;
+                    }
+                    config.severity_threshold = new_value as f32;
+                    self.db.set_server_config(&config).await?;
+
+                    return self
+                        .respond_message(
+                            ctx,
+                            command,
+                            &format!(
+                                "✅ **Severity threshold updated to {:.2}**\n\n\
+                                 This means violations with severity ≥ {:.2} will be acted upon.\n\n\
+                                 💡 **Remember**: Lower threshold = stricter moderation",
+                                new_value, new_value
+                            ),
+                        )
+                        .await;
+                }
+                "timeout" => {
+                    if !(1.0..=300.0).contains(&new_value) {
+                        return self
+                            .respond_error(
+                                ctx,
+                                command,
+                                "Buffer timeout must be between 1 and 300 seconds.",
+                            )
+                            .await;
+                    }
+                    config.buffer_timeout_secs = new_value as u64;
+                    self.db.set_server_config(&config).await?;
+
+                    return self
+                        .respond_message(
+                            ctx,
+                            command,
+                            &format!(
+                                "✅ **Buffer timeout updated to {} seconds**\n\n\
+                                 Messages will be analyzed after {} seconds of inactivity.",
+                                new_value, new_value
+                            ),
+                        )
+                        .await;
+                }
+                _ => {
+                    return self
+                        .respond_error(
+                            ctx,
+                            command,
+                            "Unknown setting. Use 'threshold' or 'timeout'.",
+                        )
+                        .await;
+                }
+            }
+        }
+
+        // If no setting/value provided, just show current config
         let config = self.db.get_server_config(guild_id.get()).await?;
 
         let response = format!(
@@ -218,7 +308,11 @@ impl SlashCommandHandler {
              • Severity Threshold: {:.2}\n\
              • Buffer Timeout: {}s\n\
              • Buffer Threshold: {} messages\n\
-             • Mod Role: {}",
+             • Mod Role: {}\n\n\
+             **To update settings:**\n\
+             • `/murdoch config setting:threshold value:0.4` - Set severity threshold\n\
+             • `/murdoch config setting:timeout value:30` - Set buffer timeout\n\n\
+             💡 **Lower threshold = stricter moderation**",
             config.severity_threshold,
             config.buffer_timeout_secs,
             config.buffer_threshold,
