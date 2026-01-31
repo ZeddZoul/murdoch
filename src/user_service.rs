@@ -302,7 +302,7 @@ impl UserService {
 
         // Step 2: Batch query database for missing users
         let mut missing_from_db: Vec<u64> = Vec::new();
-        
+
         // Build IN clause for batch query (SQLite supports up to 999 variables)
         for chunk in missing_from_memory.chunks(500) {
             let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
@@ -310,35 +310,35 @@ impl UserService {
                 "SELECT user_id, username, discriminator, avatar, cached_at FROM user_cache WHERE user_id IN ({})",
                 placeholders.join(",")
             );
-            
+
             let mut query_builder = sqlx::query(&query);
             for &user_id in chunk {
                 query_builder = query_builder.bind(user_id as i64);
             }
-            
+
             let rows = query_builder
                 .fetch_all(self.db.pool())
                 .await
                 .unwrap_or_default();
-            
+
             let mut found_in_db: std::collections::HashSet<u64> = std::collections::HashSet::new();
-            
+
             for row in rows {
                 let user_id: i64 = row.get("user_id");
                 let user_id = user_id as u64;
                 let username: String = row.get("username");
-                
+
                 // Skip deleted users
                 if username.starts_with("Deleted User #") {
                     found_in_db.insert(user_id);
                     continue;
                 }
-                
+
                 let cached_at_str: String = row.get("cached_at");
                 let cached_at = DateTime::parse_from_rfc3339(&cached_at_str)
                     .map(|dt| dt.with_timezone(&Utc))
                     .unwrap_or_else(|_| Utc::now());
-                
+
                 let user_info = UserInfo {
                     user_id,
                     username,
@@ -346,7 +346,7 @@ impl UserService {
                     avatar: row.get("avatar"),
                     cached_at,
                 };
-                
+
                 // Check staleness - if stale, we should refetch but still use cached for now
                 if !user_info.is_stale() {
                     // Cache in memory for next time
@@ -362,7 +362,7 @@ impl UserService {
                     // Don't add to missing_from_db - use stale data to avoid blocking
                 }
             }
-            
+
             // Track users not found in database
             for &user_id in chunk {
                 if !found_in_db.contains(&user_id) {
@@ -376,7 +376,7 @@ impl UserService {
         if !missing_from_db.is_empty() {
             // Only fetch first 20 to avoid blocking - the rest will be fetched on next request
             let to_fetch: Vec<u64> = missing_from_db.into_iter().take(20).collect();
-            
+
             let fetch_results: Vec<(u64, Option<Arc<UserInfo>>)> = stream::iter(to_fetch)
                 .map(|user_id| async move {
                     match self.fetch_from_discord(user_id).await {
@@ -387,7 +387,7 @@ impl UserService {
                 .buffer_unordered(5)
                 .collect()
                 .await;
-            
+
             for (user_id, user_info) in fetch_results {
                 if let Some(info) = user_info {
                     result_map.insert(user_id, info);

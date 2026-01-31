@@ -574,9 +574,8 @@ fn get_session_id(parts: &Parts) -> Option<String> {
         .ok()?
         .split(';')
         .find_map(|cookie| {
-            let mut parts = cookie.trim().splitn(2, '=');
-            let name = parts.next()?;
-            let value = parts.next()?;
+            let (name, value) = cookie.trim().split_once('=')?;
+
             if name == "murdoch_session" {
                 Some(value.to_string())
             } else {

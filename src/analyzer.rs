@@ -155,22 +155,43 @@ impl GeminiAnalyzer {
             return Ok(AnalysisResponse { violations: vec![] });
         }
 
+        tracing::info!(
+            message_count = messages.len(),
+            "Starting Gemini API analysis"
+        );
+
         self.rate_limiter.until_ready().await;
 
         let request = self.build_request(&messages);
         let url = format!("{}?key={}", GEMINI_API_URL, self.api_key);
-        
+
         // Retry logic for transient network failures
         let mut last_error = None;
         for attempt in 0..3 {
             if attempt > 0 {
                 let delay = Duration::from_millis(500 * (1 << attempt));
                 tokio::time::sleep(delay).await;
-                tracing::debug!(attempt = attempt + 1, "Retrying Gemini API request");
+                tracing::warn!(
+                    attempt = attempt + 1,
+                    delay_ms = delay.as_millis(),
+                    "Retrying Gemini API request after failure"
+                );
             }
-            
+
+            tracing::debug!(
+                attempt = attempt + 1,
+                url = %GEMINI_API_URL,
+                "Sending request to Gemini API"
+            );
+
             match self.client.post(&url).json(&request).send().await {
                 Ok(response) => {
+                    let status = response.status();
+                    tracing::debug!(
+                        status = %status,
+                        "Received response from Gemini API"
+                    );
+
                     // Check for rate limiting
                     if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
                         let retry_after = response
@@ -180,6 +201,11 @@ impl GeminiAnalyzer {
                             .and_then(|s| s.parse::<u64>().ok())
                             .unwrap_or(60);
 
+                        tracing::error!(
+                            retry_after_secs = retry_after,
+                            "Gemini API rate limit exceeded"
+                        );
+
                         return Err(MurdochError::RateLimited {
                             retry_after_ms: retry_after * 1000,
                         });
@@ -188,6 +214,11 @@ impl GeminiAnalyzer {
                     if !response.status().is_success() {
                         let status = response.status();
                         let body = response.text().await.unwrap_or_default();
+                        tracing::error!(
+                            status = %status,
+                            body = %body,
+                            "Gemini API returned error status"
+                        );
                         return Err(MurdochError::GeminiApi(format!(
                             "HTTP {}: {}",
                             status, body
@@ -198,12 +229,28 @@ impl GeminiAnalyzer {
                     return self.parse_response(gemini_response);
                 }
                 Err(e) => {
-                    tracing::warn!(attempt = attempt + 1, error = %e, "Gemini API request failed");
+                    tracing::error!(
+                        attempt = attempt + 1,
+                        error = %e,
+                        error_debug = ?e,
+                        "Gemini API request failed with network error"
+                    );
+                    tracing::error!(
+                        attempt = attempt + 1,
+                        error = %e,
+                        error_debug = ?e,
+                        "Gemini API request failed with network error"
+                    );
                     last_error = Some(e);
                 }
             }
         }
-        
+
+        tracing::error!(
+            error = ?last_error,
+            "Gemini API failed after 3 retry attempts"
+        );
+
         Err(MurdochError::Http(last_error.unwrap()))
     }
 
@@ -270,6 +317,13 @@ impl GeminiAnalyzer {
             return Ok(EnhancedAnalysisResponse::default());
         }
 
+        tracing::info!(
+            message_count = messages.len(),
+            context_messages = context.recent_messages.len(),
+            has_rules = context.server_rules.is_some(),
+            "Starting enhanced Gemini API analysis with context"
+        );
+
         self.rate_limiter.until_ready().await;
 
         let request = self.build_enhanced_request(&messages, &context);
@@ -281,11 +335,27 @@ impl GeminiAnalyzer {
             if attempt > 0 {
                 let delay = Duration::from_millis(500 * (1 << attempt));
                 tokio::time::sleep(delay).await;
-                tracing::debug!(attempt = attempt + 1, "Retrying Gemini API request (enhanced)");
+                tracing::warn!(
+                    attempt = attempt + 1,
+                    delay_ms = delay.as_millis(),
+                    "Retrying enhanced Gemini API request after failure"
+                );
             }
-            
+
+            tracing::debug!(
+                attempt = attempt + 1,
+                url = %GEMINI_API_URL,
+                "Sending enhanced request to Gemini API"
+            );
+
             match self.client.post(&url).json(&request).send().await {
                 Ok(response) => {
+                    let status = response.status();
+                    tracing::debug!(
+                        status = %status,
+                        "Received response from enhanced Gemini API call"
+                    );
+
                     if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
                         let retry_after = response
                             .headers()
@@ -293,6 +363,11 @@ impl GeminiAnalyzer {
                             .and_then(|v| v.to_str().ok())
                             .and_then(|s| s.parse::<u64>().ok())
                             .unwrap_or(60);
+
+                        tracing::error!(
+                            retry_after_secs = retry_after,
+                            "Enhanced Gemini API rate limit exceeded"
+                        );
 
                         return Err(MurdochError::RateLimited {
                             retry_after_ms: retry_after * 1000,
@@ -302,6 +377,11 @@ impl GeminiAnalyzer {
                     if !response.status().is_success() {
                         let status = response.status();
                         let body = response.text().await.unwrap_or_default();
+                        tracing::error!(
+                            status = %status,
+                            body = %body,
+                            "Enhanced Gemini API returned error status"
+                        );
                         return Err(MurdochError::GeminiApi(format!(
                             "HTTP {}: {}",
                             status, body
@@ -312,12 +392,22 @@ impl GeminiAnalyzer {
                     return self.parse_enhanced_response(gemini_response);
                 }
                 Err(e) => {
-                    tracing::warn!(attempt = attempt + 1, error = %e, "Gemini API request failed (enhanced)");
+                    tracing::error!(
+                        attempt = attempt + 1,
+                        error = %e,
+                        error_debug = ?e,
+                        "Enhanced Gemini API request failed with network error"
+                    );
                     last_error = Some(e);
                 }
             }
         }
-        
+
+        tracing::error!(
+            error = ?last_error,
+            "Enhanced Gemini API failed after 3 retry attempts"
+        );
+
         Err(MurdochError::Http(last_error.unwrap()))
     }
 
